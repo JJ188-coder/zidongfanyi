@@ -60,7 +60,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 paths: paths,
                 deepSeekConfigured: DeepSeekKeychainStore().hasAPIKeyReference()
             )
-            let resourceRoot = Bundle.module.resourceURL ?? Bundle.module.bundleURL
+            let resourceRoot = Self.webResourceRoot()
             let server = LoopbackHTTPServer { token in
                 LectureAPIRouter(repository: repository, runtime: coordinator, token: token, resourcesRoot: resourceRoot)
             }
@@ -75,6 +75,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             alert.alertStyle = .critical
             alert.runModal()
         }
+    }
+
+    private static func webResourceRoot(
+        mainBundle: Bundle = .main,
+        fileManager: FileManager = .default
+    ) -> URL {
+        if let resources = mainBundle.resourceURL {
+            let packaged = resources.appendingPathComponent("Lecture_LectureApp.bundle", isDirectory: true)
+            if fileManager.fileExists(atPath: packaged.appendingPathComponent("index.html").path) {
+                return packaged
+            }
+        }
+        return Bundle.module.resourceURL ?? Bundle.module.bundleURL
     }
 
     private func recoverInterruptedLectures(_ repository: LectureRepository) {

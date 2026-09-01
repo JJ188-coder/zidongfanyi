@@ -631,6 +631,17 @@ func testWebSecurityContract() throws {
         coordinatorSource.contains("catch {\n            withState { statusMessageValue = SecretRedactor.redact(String(describing: error)) }\n            throw error\n        }"),
         "failed classroom startup should replace transient progress text with the safe actionable error"
     )
+
+    let appSource = try String(
+        contentsOf: projectRoot.appendingPathComponent("Sources/LectureApp/main.swift"),
+        encoding: .utf8
+    )
+    try expect(
+        appSource.contains(#"mainBundle.resourceURL"#)
+            && appSource.contains(#"Lecture_LectureApp.bundle"#)
+            && appSource.contains(#"packaged.appendingPathComponent("index.html")"#),
+        "installed builds must load their packaged web UI instead of falling back to an absolute Swift build directory"
+    )
 }
 
 let tests: [(String, () async throws -> Void)] = [
