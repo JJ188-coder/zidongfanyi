@@ -390,6 +390,14 @@ private func testAudioLevels() throws {
     try speechExpectClose(silence.rmsDecibels, -96, "silence RMS")
     try speechExpectClose(silence.peakDecibels, -96, "silence peak")
     try speechExpectClose(silence.normalized, 0, "silence normalized")
+
+    let quietSpeech = AudioLevelMeter.measure(samples: Array(repeating: 0.01, count: 256))
+    let normalSpeech = AudioLevelMeter.measure(samples: Array(repeating: 0.08, count: 256))
+    try speechExpect(quietSpeech.normalized > 0, "quiet classroom speech should be visible")
+    try speechExpect(
+        normalSpeech.normalized - quietSpeech.normalized > 0.25,
+        "the classroom meter should visibly distinguish quiet and normal speech"
+    )
 }
 
 private func testCheckpointCadence() throws {

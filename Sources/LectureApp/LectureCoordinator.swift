@@ -21,7 +21,10 @@ final class LectureCoordinator: LectureRuntimeControlling, @unchecked Sendable {
     private var volatileEnglishValue = ""
     private var volatileChineseValue = ""
     private var statusMessageValue: String?
-    private var operationInProgress = false
+    private var transition: LectureTransition?
+    private var lastStoppedLecture: LectureRecord?
+    private var retryingLectureIDs = Set<String>()
+    private var audioLevelUpdatedAt: Date?
     private var speechAvailableValue = false
     private var translationAvailableValue = false
     private var deepSeekConfiguredValue = false
@@ -46,10 +49,34 @@ final class LectureCoordinator: LectureRuntimeControlling, @unchecked Sendable {
 
     func runtimeSnapshot() throws -> RuntimeSnapshot {
         let recording = recorder.isRecording
-        return withState { RuntimeSnapshot(recording: activeLecture != nil && recording, activeLectureID: activeLecture?.id, duration: recording ? recorder.duration : durationValue, audioLevel: recording ? audioLevelValue : 0, volatileEnglish: volatileEnglishValue, volatileChinese: volatileChineseValue, speechAvailable: speechAvailableValue, translationAvailable: translationAvailableValue, deepSeekConfigured: deepSeekConfiguredValue, statusMessage: statusMessageValue) }
+        let duration = recorder.hasActiveSession ? recorder.duration : durationValue
+        return withState {
+            let level: Double
+            if recording, let updatedAt = audioLevelUpdatedAt {
+                let age = max(0, Date().timeIntervalSince(updatedAt))
+                level = age <= 0.25 ? audioLevelValue : audioLevelValue * exp(-(age - 0.25) * 3)
+            } else {
+                level = 0
+            }
+            return RuntimeSnapshot(
+                recording: activeLecture != nil && recording,
+                activeLectureID: activeLecture?.id,
+                duration: duration,
+                audioLevel: level,
+                volatileEnglish: volatileEnglishValue,
+                volatileChinese: volatileChineseValue,
+                speechAvailable: speechAvailableValue,
+                translationAvailable: translationAvailableValue,
+                deepSeekConfigured: deepSeekConfiguredValue,
+                statusMessage: statusMessageValue,
+                transitioning: transition != nil,
+                transitionKind: transition?.rawValue
+            )
+        }
     }
 
     func isDeepSeekConfigured() -> Bool { withState { deepSeekConfiguredValue } }
+    var hasActiveLecture: Bool { withState { activeLecture != nil } }
     func storageUsage() throws -> LectureStorageUsage { try paths.storageUsage() }
     func openTranslationSettings() {
         DispatchQueue.main.async {
@@ -58,13 +85,25 @@ final class LectureCoordinator: LectureRuntimeControlling, @unchecked Sendable {
     }
 
     func startLecture(courseID: String, title: String?) async throws -> LectureRecord {
-        let canStart = withState { () -> Bool in
-            guard activeLecture == nil, !operationInProgress else { return false }
-            operationInProgress = true
-            return true
+        enum StartDecision { case existing(LectureRecord), wait, reserved }
+        let deadline = Date().addingTimeInterval(60)
+        reserve: while true {
+            let decision = withState { () -> StartDecision in
+                if transition != nil { return .wait }
+                if let activeLecture { return .existing(activeLecture) }
+                transition = .starting
+                lastStoppedLecture = nil
+                return .reserved
+            }
+            switch decision {
+            case .existing(let lecture): return lecture
+            case .reserved: break reserve
+            case .wait:
+                guard Date() < deadline else { throw CoordinatorError.busy }
+                try await Task.sleep(for: .milliseconds(40))
+            }
         }
-        guard canStart else { throw CoordinatorError.alreadyRecording }
-        defer { withState { operationInProgress = false } }
+        defer { withState { transition = nil } }
         do {
             withState { statusMessageValue = "正在检查麦克风权限…" }
             try await LecturePermissionAuthorizer().authorizeMicrophone()
@@ -80,7 +119,6 @@ final class LectureCoordinator: LectureRuntimeControlling, @unchecked Sendable {
             let audioURL = paths.audioURL(lectureID: lecture.id)
             lecture.audioPath = audioURL.path; try repository.upsertLecture(lecture)
             let liveSpeech = LiveSpeechTranscriber(vocabulary: course.vocabulary, locale: speechLocale)
-            withState { activeLecture = lecture; activeCourse = course; speech = liveSpeech; durationValue = 0; volatileEnglishValue = ""; volatileChineseValue = ""; statusMessageValue = "本地录音与英文识别正在运行" }
             do {
                 try await liveSpeech.start(
                     lectureID: lecture.id,
@@ -93,7 +131,7 @@ final class LectureCoordinator: LectureRuntimeControlling, @unchecked Sendable {
                         }
                     }
                 )
-                try recorder.start(
+                try await recorder.start(
                     url: audioURL,
                     onBuffer: { [weak liveSpeech] buffer in liveSpeech?.append(buffer) },
                     onLevel: { [weak self] level in self?.setAudioLevel(level.normalized) },
@@ -103,6 +141,17 @@ final class LectureCoordinator: LectureRuntimeControlling, @unchecked Sendable {
                         self.withState { self.statusMessageValue = "录音写入警告：\(error)" }
                     }
                 )
+                withState {
+                    activeLecture = lecture
+                    activeCourse = course
+                    speech = liveSpeech
+                    durationValue = 0
+                    audioLevelValue = 0
+                    audioLevelUpdatedAt = nil
+                    volatileEnglishValue = ""
+                    volatileChineseValue = ""
+                    statusMessageValue = "麦克风收音正常；本地英文识别正在运行"
+                }
             } catch {
                 await liveSpeech.cancel(); try? repository.deleteLecture(id: lecture.id); clearActive(); throw error
             }
@@ -115,27 +164,45 @@ final class LectureCoordinator: LectureRuntimeControlling, @unchecked Sendable {
 
     func stopLecture() async throws -> LectureRecord {
         enum StopReservation {
-            case busy
+            case wait
             case idle
+            case stopped(LectureRecord)
             case reserved(LectureRecord, Course?, LiveSpeechTranscriber?)
         }
-        let reservation = withState { () -> StopReservation in
-            guard !operationInProgress else { return .busy }
-            guard let activeLecture else { return .idle }
-            operationInProgress = true
-            return .reserved(activeLecture, activeCourse, speech)
-        }
-        switch reservation {
-        case .busy: throw CoordinatorError.busy
-        case .idle: throw CoordinatorError.notRecording
-        case .reserved(var lecture, let course, let liveSpeech):
-            defer { withState { operationInProgress = false } }
-            let duration = recorder.stop(); await liveSpeech?.finish()
-            lecture.duration = duration; lecture.endedAt = Date(); lecture.status = .reviewingEnglish; lecture.updatedAt = Date(); try repository.upsertLecture(lecture)
-            withState { durationValue = duration; statusMessageValue = "录音已安全保存，正在本地复核英文" }
-            clearActive(keepStatus: true)
-            Task { [weak self] in await self?.processAfterClass(lecture: lecture, course: course) }
-            return lecture
+        let deadline = Date().addingTimeInterval(60)
+        reserve: while true {
+            let reservation = withState { () -> StopReservation in
+                if transition != nil { return .wait }
+                guard let activeLecture else {
+                    return lastStoppedLecture.map(StopReservation.stopped) ?? .idle
+                }
+                transition = .stopping
+                return .reserved(activeLecture, activeCourse, speech)
+            }
+            switch reservation {
+            case .wait:
+                guard Date() < deadline else { throw CoordinatorError.busy }
+                try await Task.sleep(for: .milliseconds(40))
+            case .idle: throw CoordinatorError.notRecording
+            case .stopped(let lecture): return lecture
+            case .reserved(var lecture, let course, let liveSpeech):
+                defer { withState { transition = nil } }
+                let duration = recorder.stop()
+                await liveSpeech?.finish()
+                lecture.duration = duration
+                lecture.endedAt = Date()
+                lecture.status = .reviewingEnglish
+                lecture.updatedAt = Date()
+                try repository.upsertLecture(lecture)
+                withState {
+                    durationValue = duration
+                    statusMessageValue = "录音已安全保存，正在本地复核英文"
+                    lastStoppedLecture = lecture
+                }
+                clearActive(keepStatus: true)
+                Task { [weak self] in await self?.processAfterClass(lecture: lecture, course: course) }
+                return lecture
+            }
         }
     }
 
@@ -149,12 +216,10 @@ final class LectureCoordinator: LectureRuntimeControlling, @unchecked Sendable {
     func retryProcessing(lectureID: String) async throws {
         guard let lecture = try repository.lecture(id: lectureID), let course = try repository.course(id: lecture.courseID) else { throw CoordinatorError.missingLecture }
         let canRetry = withState { () -> Bool in
-            guard !operationInProgress else { return false }
-            operationInProgress = true
-            return true
+            retryingLectureIDs.insert(lectureID).inserted
         }
         guard canRetry else { throw CoordinatorError.busy }
-        defer { withState { operationInProgress = false } }
+        defer { _ = withState { retryingLectureIDs.remove(lectureID) } }
         await processAfterClass(lecture: lecture, course: course)
     }
 
@@ -236,7 +301,12 @@ final class LectureCoordinator: LectureRuntimeControlling, @unchecked Sendable {
         withState { statusMessageValue = lecture.status == .completed ? "课后复核与总结已完成" : "课后处理可在历史记录中重试" }
     }
 
-    private func setAudioLevel(_ value: Double) { withState { audioLevelValue = value } }
+    private func setAudioLevel(_ value: Double) {
+        withState {
+            audioLevelValue = value >= audioLevelValue ? value : max(value, audioLevelValue * 0.90)
+            audioLevelUpdatedAt = Date()
+        }
+    }
     private func persistCheckpoint(_ checkpoint: RecordingCheckpoint) {
         guard var lecture = withState({ activeLecture }) else { return }
         lecture.duration = checkpoint.elapsedTime
@@ -249,8 +319,13 @@ final class LectureCoordinator: LectureRuntimeControlling, @unchecked Sendable {
             throw CoordinatorError.lowDiskSpace
         }
     }
-    private func clearActive(keepStatus: Bool = false) { withState { activeLecture = nil; activeCourse = nil; speech = nil; audioLevelValue = 0; volatileEnglishValue = ""; volatileChineseValue = ""; if !keepStatus { statusMessageValue = nil } } }
+    private func clearActive(keepStatus: Bool = false) { withState { activeLecture = nil; activeCourse = nil; speech = nil; audioLevelValue = 0; audioLevelUpdatedAt = nil; volatileEnglishValue = ""; volatileChineseValue = ""; if !keepStatus { statusMessageValue = nil } } }
     private func defaultTitle() -> String { let formatter = DateFormatter(); formatter.dateFormat = "yyyy-MM-dd HH:mm 课堂"; return formatter.string(from: Date()) }
+}
+
+private enum LectureTransition: String {
+    case starting
+    case stopping
 }
 
 private enum CoordinatorError: Error, CustomStringConvertible {

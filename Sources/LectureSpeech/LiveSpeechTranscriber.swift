@@ -160,6 +160,10 @@ public final class LiveSpeechTranscriber: @unchecked Sendable {
             } else if finishing, pendingSamples.count >= minimumFinalSampleCount {
                 count = pendingSamples.count
             } else {
+                if finishing, !pendingSamples.isEmpty {
+                    pendingStartSample += Int64(pendingSamples.count)
+                    pendingSamples.removeAll(keepingCapacity: false)
+                }
                 processing = false
                 waitersToResume = takeFinishWaitersIfReadyLocked()
                 return nil

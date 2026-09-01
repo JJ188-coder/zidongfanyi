@@ -8,10 +8,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var statusItem: NSStatusItem!
     private var server: LoopbackHTTPServer?
     private var coordinator: LectureCoordinator?
+    private var terminationTask: Task<Void, Never>?
+    private var terminationReplyPending = false
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         configureMenu()
         Task { await launchService() }
+    }
+
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        guard coordinator?.hasActiveLecture == true else { return .terminateNow }
+        guard !terminationReplyPending else { return .terminateLater }
+        terminationReplyPending = true
+        terminationTask = Task { [weak self, weak sender] in
+            guard let self else { return }
+            _ = try? await coordinator?.stopLecture()
+            server?.stop()
+            await MainActor.run {
+                self.terminationReplyPending = false
+                sender?.reply(toApplicationShouldTerminate: true)
+            }
+        }
+        return .terminateLater
     }
 
     func applicationWillTerminate(_ notification: Notification) { server?.stop() }

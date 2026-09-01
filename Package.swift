@@ -49,7 +49,7 @@ let package = Package(
             name: "LectureTests",
             dependencies: ["LectureCore", "LectureServer", "LectureSpeech"],
             path: "Tests",
-            exclude: ["ServerSmoke", "KeyImportSmoke", "DeepSeekSmoke", "SpeechFileSmoke", "WhisperSmoke", "LiveWhisperSmoke"],
+            exclude: ["ServerSmoke", "KeyImportSmoke", "DeepSeekSmoke", "SpeechFileSmoke", "WhisperSmoke", "LiveWhisperSmoke", "CoordinatorConcurrencySmoke"],
             sources: ["main.swift", "LectureSpeechTests/LectureSpeechTestSuite.swift"]
         ),
         .executableTarget(
@@ -81,6 +81,11 @@ let package = Package(
             name: "LectureLiveWhisperSmoke",
             dependencies: ["LectureCore", "LectureSpeech"],
             path: "Tests/LiveWhisperSmoke"
+        ),
+        .executableTarget(
+            name: "LectureCoordinatorConcurrencySmoke",
+            dependencies: ["LectureCore", "LectureServer"],
+            path: "Tests/CoordinatorConcurrencySmoke"
         ),
     ],
     swiftLanguageModes: [.v5]

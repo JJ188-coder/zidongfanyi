@@ -8,6 +8,7 @@ public final class MicrophoneRecorder: @unchecked Sendable {
     public typealias ErrorHandler = @Sendable (Error) -> Void
     private let engine = AVAudioEngine()
     private let queue = DispatchQueue(label: "com.jiyuanyi.Lecture.Recorder")
+    private let stateLock = NSLock()
     private var file: AVAudioFile?
     private var startedAt: Date?
     private var bufferHandler: BufferHandler?
@@ -19,11 +20,20 @@ public final class MicrophoneRecorder: @unchecked Sendable {
     private var sampleRate = 0.0
     private var recordedFrames: Int64 = 0
     private var tapInstalled = false
+    private var lastBufferAt: Date?
 
     public init() {}
-    public var isRecording: Bool { startedAt != nil }
-    public var duration: TimeInterval { startedAt.map { Date().timeIntervalSince($0) } ?? 0 }
-    public var inputFormat: AVAudioFormat { engine.inputNode.inputFormat(forBus: 0) }
+    public var isRecording: Bool {
+        stateLock.withLock {
+            guard startedAt != nil, engine.isRunning, let lastBufferAt else { return false }
+            return Date().timeIntervalSince(lastBufferAt) < 2
+        }
+    }
+    public var hasActiveSession: Bool { stateLock.withLock { startedAt != nil } }
+    public var duration: TimeInterval {
+        stateLock.withLock { startedAt.map { Date().timeIntervalSince($0) } ?? 0 }
+    }
+    public var inputFormat: AVAudioFormat { engine.inputNode.outputFormat(forBus: 0) }
 
     public static func protectRecording(
         at url: URL,
@@ -44,11 +54,12 @@ public final class MicrophoneRecorder: @unchecked Sendable {
         onLevel: @escaping LevelHandler,
         onCheckpoint: CheckpointHandler? = nil,
         onError: ErrorHandler? = nil
-    ) throws {
+    ) async throws {
         guard !engine.isRunning, !tapInstalled else { throw RecorderError.alreadyRecording }
         try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+        engine.reset()
         let input = engine.inputNode
-        let format = input.inputFormat(forBus: 0)
+        let format = input.outputFormat(forBus: 0)
         guard format.sampleRate > 0, format.channelCount > 0 else { throw RecorderError.noMicrophone }
         let settings = Self.recordingSettings(for: format)
         file = try AVAudioFile(
@@ -65,18 +76,22 @@ public final class MicrophoneRecorder: @unchecked Sendable {
         outputURL = url
         sampleRate = format.sampleRate
         recordedFrames = 0
+        let firstBuffer = FirstAudioBufferSignal()
         input.installTap(onBus: 0, bufferSize: 2048, format: format) { [weak self] buffer, _ in
             guard let self else { return }
             let copy = Self.copy(buffer)
             self.queue.async {
                 do {
-                    try self.file?.write(from: copy)
+                    guard let file = self.file else { throw RecorderError.audioFileClosed }
+                    try file.write(from: copy)
+                    self.stateLock.withLock { self.lastBufferAt = Date() }
+                    firstBuffer.succeed()
                 } catch {
+                    firstBuffer.fail(error)
                     self.errorHandler?(error)
+                    return
                 }
-                if let channel = copy.floatChannelData?[0] {
-                    self.levelHandler?(AudioLevelMeter.measure(interleavedSamples: UnsafeBufferPointer(start: channel, count: Int(copy.frameLength))))
-                }
+                self.levelHandler?(Self.measureLevel(in: copy))
                 self.recordedFrames += Int64(copy.frameLength)
                 let elapsed = Double(self.recordedFrames) / self.sampleRate
                 if self.checkpointScheduler.shouldEmit(elapsedTime: elapsed), let outputURL = self.outputURL {
@@ -94,19 +109,13 @@ public final class MicrophoneRecorder: @unchecked Sendable {
             engine.prepare()
             try engine.start()
             guard engine.isRunning else { throw RecorderError.engineStopped }
-            startedAt = Date()
-        } catch {
-            if tapInstalled { input.removeTap(onBus: 0); tapInstalled = false }
-            queue.sync {
-                file = nil
-                bufferHandler = nil
-                levelHandler = nil
-                checkpointHandler = nil
-                errorHandler = nil
-                outputURL = nil
-                sampleRate = 0
-                recordedFrames = 0
+            stateLock.withLock {
+                startedAt = Date()
+                lastBufferAt = nil
             }
+            try await firstBuffer.wait(timeout: .seconds(3))
+        } catch {
+            _ = stop()
             throw error
         }
     }
@@ -136,7 +145,11 @@ public final class MicrophoneRecorder: @unchecked Sendable {
             sampleRate = 0
             recordedFrames = 0
         }
-        startedAt = nil
+        engine.reset()
+        stateLock.withLock {
+            startedAt = nil
+            lastBufferAt = nil
+        }
         return value
     }
 
@@ -149,6 +162,44 @@ public final class MicrophoneRecorder: @unchecked Sendable {
             if let destination = audioBuffers[index].mData, let origin = sourceBuffers[index].mData { memcpy(destination, origin, Int(sourceBuffers[index].mDataByteSize)); audioBuffers[index].mDataByteSize = sourceBuffers[index].mDataByteSize }
         }
         return result
+    }
+
+    private static func measureLevel(in buffer: AVAudioPCMBuffer) -> AudioLevel {
+        let frameCount = Int(buffer.frameLength)
+        let channelCount = Int(buffer.format.channelCount)
+        guard frameCount > 0, channelCount > 0 else {
+            return AudioLevelMeter.measure(samples: [])
+        }
+        switch buffer.format.commonFormat {
+        case .pcmFormatFloat32:
+            guard let data = buffer.floatChannelData else { return AudioLevelMeter.measure(samples: []) }
+            if buffer.format.isInterleaved {
+                return AudioLevelMeter.measure(samples: Array(UnsafeBufferPointer(start: data[0], count: frameCount * channelCount)))
+            }
+            return AudioLevelMeter.measure(samples: (0..<channelCount).flatMap {
+                Array(UnsafeBufferPointer(start: data[$0], count: frameCount))
+            })
+        case .pcmFormatInt16:
+            guard let data = buffer.int16ChannelData else { return AudioLevelMeter.measure(samples: []) }
+            let samplesPerChannel = buffer.format.isInterleaved ? frameCount * channelCount : frameCount
+            let channels = buffer.format.isInterleaved ? 1 : channelCount
+            return AudioLevelMeter.measure(samples: (0..<channels).flatMap { channel in
+                UnsafeBufferPointer(start: data[channel], count: samplesPerChannel).map {
+                    Float($0) / Float(Int16.max)
+                }
+            })
+        case .pcmFormatInt32:
+            guard let data = buffer.int32ChannelData else { return AudioLevelMeter.measure(samples: []) }
+            let samplesPerChannel = buffer.format.isInterleaved ? frameCount * channelCount : frameCount
+            let channels = buffer.format.isInterleaved ? 1 : channelCount
+            return AudioLevelMeter.measure(samples: (0..<channels).flatMap { channel in
+                UnsafeBufferPointer(start: data[channel], count: samplesPerChannel).map {
+                    Float(Double($0) / Double(Int32.max))
+                }
+            })
+        default:
+            return AudioLevelMeter.measure(samples: [])
+        }
     }
 
     public static func recordingSettings(for format: AVAudioFormat) -> [String: Any] {
@@ -185,12 +236,57 @@ public struct RecordingCheckpoint: Codable, Hashable, Sendable {
 }
 
 public enum RecorderError: Error, CustomStringConvertible {
-    case alreadyRecording, noMicrophone, engineStopped
+    case alreadyRecording, noMicrophone, engineStopped, noAudioBuffers, audioFileClosed
     public var description: String {
         switch self {
         case .alreadyRecording: "已有课堂正在录音"
         case .noMicrophone: "没有检测到可用麦克风"
         case .engineStopped: "麦克风启动后立即停止，请重新连接或切换输入设备后重试"
+        case .noAudioBuffers: "麦克风已启动，但没有收到任何声音数据，请检查系统输入设备后重试"
+        case .audioFileClosed: "录音文件已意外关闭"
         }
+    }
+}
+
+private final class FirstAudioBufferSignal: @unchecked Sendable {
+    private let lock = NSLock()
+    private var continuation: CheckedContinuation<Void, Error>?
+    private var result: Result<Void, Error>?
+
+    func wait(timeout: Duration) async throws {
+        try await withCheckedThrowingContinuation { continuation in
+            let existing = lock.withLock { () -> Result<Void, Error>? in
+                if let result { return result }
+                self.continuation = continuation
+                return nil
+            }
+            if let existing { continuation.resume(with: existing) }
+            Task { [weak self] in
+                try? await Task.sleep(for: timeout)
+                self?.fail(RecorderError.noAudioBuffers)
+            }
+        }
+    }
+
+    func succeed() { resolve(.success(())) }
+    func fail(_ error: Error) { resolve(.failure(error)) }
+
+    private func resolve(_ result: Result<Void, Error>) {
+        let continuation = lock.withLock { () -> CheckedContinuation<Void, Error>? in
+            guard self.result == nil else { return nil }
+            self.result = result
+            let continuation = self.continuation
+            self.continuation = nil
+            return continuation
+        }
+        continuation?.resume(with: result)
+    }
+}
+
+private extension NSLock {
+    func withLock<Value>(_ body: () throws -> Value) rethrows -> Value {
+        lock()
+        defer { unlock() }
+        return try body()
     }
 }
