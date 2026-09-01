@@ -302,8 +302,19 @@ final class LectureCoordinator: LectureRuntimeControlling, @unchecked Sendable {
             lecture.status = .processingDeepSeek; lecture.updatedAt = Date(); try repository.upsertLecture(lecture)
             let base = TranscriptPreference.english(live: live, reviewed: reviewed)
             if (try? keychain.loadAPIKey()) != nil {
-                for segment in try await deepSeek.correctTranslation(englishSegments: base, vocabulary: course?.vocabulary ?? []) { try repository.appendTranscript(segment) }
-                let summary = try await deepSeek.generateStudySummary(lectureTitle: lecture.title, transcript: base); try repository.appendSummary(.init(lectureID: lecture.id, content: summary))
+                var translationWarning: String?
+                do {
+                    for segment in try await deepSeek.correctTranslation(englishSegments: base, vocabulary: course?.vocabulary ?? []) {
+                        try repository.appendTranscript(segment)
+                    }
+                } catch {
+                    translationWarning = SecretRedactor.redact(String(describing: error))
+                }
+                let summary = try await deepSeek.generateStudySummary(lectureTitle: lecture.title, transcript: base)
+                try repository.appendSummary(.init(lectureID: lecture.id, content: summary))
+                if translationWarning != nil {
+                    withState { statusMessageValue = "总结已完成；中文校正暂时沿用实时翻译" }
+                }
             }
             lecture.status = .completed; lecture.errorMessage = nil
         } catch { lecture.status = .failed; lecture.errorMessage = SecretRedactor.redact(String(describing: error)) }

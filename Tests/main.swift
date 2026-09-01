@@ -369,7 +369,7 @@ func testDeepSeekRequestShapeAndRedaction() async throws {
 func testDeepSeekWorkflows() async throws {
     StubURLProtocol.reset()
     let summary = #"{"overview":"Utility maximization","coreConcepts":["MRS"],"definitions":[],"professorExamples":[],"professorEmphasis":[],"possibleExamTopics":[],"unresolvedQuestions":[],"glossary":[] }"#
-    StubURLProtocol.enqueue(body: try completionEnvelope(content: #"{"translations":[{"unitID":"seg-1-0","chinese":"边际替代率递减。"}]}"#))
+    StubURLProtocol.enqueue(body: try completionEnvelope(content: #"{"translations":[{"index":0,"chinese":"边际替代率递减。"}]}"#))
     StubURLProtocol.enqueue(body: try completionEnvelope(content: summary))
     StubURLProtocol.enqueue(body: try completionEnvelope(content: #"{"answer":"教授说边际替代率沿凸无差异曲线递减。","foundEvidence":true,"citedEvidenceIDs":["ev-1"]}"#))
 
@@ -391,7 +391,7 @@ func testDeepSeekWorkflows() async throws {
 func testDeepSeekTranslationRetrySafety() async throws {
     StubURLProtocol.reset()
     let response = try completionEnvelope(
-        content: #"{"translations":[{"unitID":"seg-retry-0","chinese":"重试后仍是同一段。"}]}"#
+        content: #"{"translations":[{"index":0,"chinese":"重试后仍是同一段。"}]}"#
     )
     StubURLProtocol.enqueue(body: response)
     StubURLProtocol.enqueue(body: response)
@@ -415,10 +415,10 @@ func testDeepSeekTranslationRetrySafety() async throws {
 
     StubURLProtocol.reset()
     StubURLProtocol.enqueue(body: try completionEnvelope(content: #"{"translations":[]}"#))
-    StubURLProtocol.enqueue(body: try completionEnvelope(content: #"{"translations":[{"unitID":"invented-id","chinese":"错误 ID"}]}"#))
-    StubURLProtocol.enqueue(body: try completionEnvelope(content: #"{"translations":[{"unitID":"seg-retry-0","chinese":"恢复后的翻译。"}]}"#))
+    StubURLProtocol.enqueue(body: try completionEnvelope(content: #"{"translations":[{"index":99,"chinese":"错误序号"}]}"#))
+    StubURLProtocol.enqueue(body: try completionEnvelope(content: #"{"translations":[{"index":0,"chinese":"恢复后的翻译。"}]}"#))
     let recovered = try await client.correctTranslation(englishSegments: [segment], vocabulary: [])
-    try expect(recovered.first?.text == "恢复后的翻译。", "translation should retry malformed DeepSeek unit IDs")
+    try expect(recovered.first?.text == "恢复后的翻译。", "translation should retry malformed DeepSeek indices")
     try expect(StubURLProtocol.requests().count == 3, "a malformed translation chunk should retry at most three times")
 
     StubURLProtocol.reset()

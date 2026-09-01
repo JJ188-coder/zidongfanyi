@@ -19,45 +19,46 @@ public final class DeepSeekClient: @unchecked Sendable {
     }
 
     public func correctTranslation(englishSegments: [TranscriptSegment], vocabulary: [String]) async throws -> [TranscriptSegment] {
-        struct Translation: Decodable { let unitID: String; let chinese: String }
+        struct Translation: Decodable { let index: Int; let chinese: String }
         struct Result: Decodable { let translations: [Translation] }
         guard englishSegments.contains(where: \.isFinal) else { throw DeepSeekError.missingTranscript }
         var output: [TranscriptSegment] = []
         for chunk in DeepSeekTranscriptChunker.chunks(from: englishSegments) {
-            let byID = Dictionary(uniqueKeysWithValues: chunk.units.map { ($0.id, $0) })
-            let input = try jsonString(chunk.units)
-            var translatedByUnitID: [String: String]?
+            struct TranslationInput: Encodable { let index: Int; let text: String }
+            let inputUnits = chunk.units.enumerated().map { TranslationInput(index: $0.offset, text: $0.element.text) }
+            let input = try jsonString(inputUnits)
+            var translatedByIndex: [Int: String]?
             var lastError: Error?
             for attempt in 0..<3 {
                 do {
                     let raw = try await complete(
-                        system: "Translate university lecture English into accurate Simplified Chinese. Copy each supplied unit id exactly once into unitID; never invent, shorten, reorder, or duplicate IDs. Return only JSON: {\"translations\":[{\"unitID\":\"exact supplied id\",\"chinese\":\"...\"}]}. Course vocabulary: \(vocabulary.joined(separator: ", "))",
+                        system: "Translate university lecture English into accurate Simplified Chinese. Return every supplied integer index exactly once, unchanged and in order. Return only JSON: {\"translations\":[{\"index\":0,\"chinese\":\"...\"}]}. Course vocabulary: \(vocabulary.joined(separator: ", "))",
                         user: input
                     )
                     let parsed: Result = try DeepSeekResponseParser.decodeJSON(Result.self, from: raw)
-                    var candidate: [String: String] = [:]
+                    var candidate: [Int: String] = [:]
                     for value in parsed.translations {
-                        guard byID[value.unitID] != nil, candidate[value.unitID] == nil else {
-                            throw DeepSeekError.invalidResponse("翻译单元 ID 无效或重复")
+                        guard chunk.units.indices.contains(value.index), candidate[value.index] == nil else {
+                            throw DeepSeekError.invalidResponse("翻译序号无效或重复")
                         }
                         let chinese = value.chinese.trimmingCharacters(in: .whitespacesAndNewlines)
                         guard !chinese.isEmpty else { throw DeepSeekError.invalidResponse("翻译内容为空") }
-                        candidate[value.unitID] = chinese
+                        candidate[value.index] = chinese
                     }
                     guard candidate.count == chunk.units.count else {
                         throw DeepSeekError.invalidResponse("翻译结果缺少部分逐字稿单元")
                     }
-                    translatedByUnitID = candidate
+                    translatedByIndex = candidate
                     break
                 } catch {
                     lastError = error
                     if attempt < 2 { try? await Task.sleep(for: .milliseconds(Int64(400 * (attempt + 1)))) }
                 }
             }
-            guard let translatedByUnitID else { throw lastError ?? DeepSeekError.invalidResponse("翻译失败") }
-            for unit in chunk.units {
-                guard let chinese = translatedByUnitID[unit.id] else {
-                    throw DeepSeekError.invalidResponse("翻译结果缺少逐字稿单元 \(unit.id)")
+            guard let translatedByIndex else { throw lastError ?? DeepSeekError.invalidResponse("翻译失败") }
+            for (index, unit) in chunk.units.enumerated() {
+                guard let chinese = translatedByIndex[index] else {
+                    throw DeepSeekError.invalidResponse("翻译结果缺少逐字稿单元")
                 }
                 output.append(.init(
                     id: "deepseek-zh-\(unit.id)",
