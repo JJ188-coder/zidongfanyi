@@ -581,6 +581,12 @@ func testWebSecurityContract() throws {
     try expect(appJavaScript.contains("正在准备…"), "long-running start should show visible progress")
     try expect(appJavaScript.contains("control.disabled = true"), "long-running controls should prevent duplicate requests")
     try expect(
+        appJavaScript.contains("const newestFirst = values => values.slice(-12).reverse()")
+            && appJavaScript.contains("preservedStreams")
+            && appJavaScript.contains("stream.scrollTop = previous.scrollTop +"),
+        "live transcripts should show newest items first without moving a reader who scrolled into older text"
+    )
+    try expect(
         appJavaScript.contains("pendingAudioTime") && appJavaScript.contains("applyPendingAudioJump()"),
         "Q&A citations should carry their timestamp into the lecture audio player"
     )
