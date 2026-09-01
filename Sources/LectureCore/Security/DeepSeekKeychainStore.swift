@@ -17,7 +17,9 @@ public struct DeepSeekKeychainStore: DeepSeekAPIKeyProviding, Sendable {
 
     public func saveAPIKey(_ rawValue: String) throws {
         let value = rawValue.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard value.hasPrefix("sk-"), value.count >= 12 else { throw KeychainError.invalidKey }
+        guard value.count >= 8, value.count <= 8_192, !value.contains(where: \.isWhitespace) else {
+            throw KeychainError.invalidKey
+        }
         let data = Data(value.utf8)
         let query = baseQuery
         let update = [kSecValueData as String: data]
@@ -69,7 +71,7 @@ public enum KeychainError: Error, CustomStringConvertible {
     case status(OSStatus)
     public var description: String {
         switch self {
-        case .invalidKey: return "DeepSeek API Key 格式无效"
+        case .invalidKey: return "API Key 格式无效"
         case .status(let status): return "macOS 钥匙串操作失败（\(status)）"
         }
     }

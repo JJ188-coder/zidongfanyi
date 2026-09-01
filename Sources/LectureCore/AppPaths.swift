@@ -31,6 +31,9 @@ public struct AppPaths: Sendable {
     public let speechModels: URL
     public let whisper: URL
     public let whisperModel: URL
+    public let whisperQualityModel: URL
+    public let whisperVADModel: URL
+    public let aiConfiguration: URL
     public let whisperWorking: URL
 
     public init(root: URL) {
@@ -42,6 +45,9 @@ public struct AppPaths: Sendable {
         self.speechModels = root.appendingPathComponent("SpeechModels", isDirectory: true)
         self.whisper = root.appendingPathComponent("Whisper", isDirectory: true)
         self.whisperModel = whisper.appendingPathComponent("ggml-base.en.bin")
+        self.whisperQualityModel = whisper.appendingPathComponent("ggml-small.en.bin")
+        self.whisperVADModel = whisper.appendingPathComponent("ggml-silero-v6.2.0.bin")
+        self.aiConfiguration = root.appendingPathComponent("ai-provider.json")
         self.whisperWorking = working.appendingPathComponent("Whisper", isDirectory: true)
     }
 
@@ -72,6 +78,20 @@ public struct AppPaths: Sendable {
             }
             try fileManager.setAttributes([.posixPermissions: 0o600], ofItemAtPath: whisperModel.path)
         }
+        if fileManager.fileExists(atPath: whisperVADModel.path) {
+            let values = try whisperVADModel.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey])
+            guard values.isRegularFile == true, values.isSymbolicLink != true else {
+                throw AppPathError.unsafeWhisperModel
+            }
+            try fileManager.setAttributes([.posixPermissions: 0o600], ofItemAtPath: whisperVADModel.path)
+        }
+        if fileManager.fileExists(atPath: whisperQualityModel.path) {
+            let values = try whisperQualityModel.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey])
+            guard values.isRegularFile == true, values.isSymbolicLink != true else {
+                throw AppPathError.unsafeWhisperModel
+            }
+            try fileManager.setAttributes([.posixPermissions: 0o600], ofItemAtPath: whisperQualityModel.path)
+        }
         for url in try fileManager.contentsOfDirectory(
             at: recordings,
             includingPropertiesForKeys: [.isRegularFileKey, .isSymbolicLinkKey],
@@ -84,6 +104,9 @@ public struct AppPaths: Sendable {
         for url in [database, database.appendingPathExtension("wal"), database.appendingPathExtension("shm")]
         where fileManager.fileExists(atPath: url.path) {
             try fileManager.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
+        }
+        if fileManager.fileExists(atPath: aiConfiguration.path) {
+            try fileManager.setAttributes([.posixPermissions: 0o600], ofItemAtPath: aiConfiguration.path)
         }
     }
 

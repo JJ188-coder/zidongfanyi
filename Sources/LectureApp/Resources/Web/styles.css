@@ -393,6 +393,16 @@ svg {
 .control-rail { display: grid; grid-template-columns: minmax(240px, 1fr) minmax(180px, .7fr) auto; align-items: end; gap: 24px; padding: 18px 0; border-top: 1px solid var(--ink); border-bottom: 1px solid var(--line); }
 .select-field, .level-block { display: grid; gap: 8px; color: var(--muted); font-family: var(--mono); font-size: 9px; letter-spacing: .08em; text-transform: uppercase; }
 .select-field select { min-height: 44px; padding: 0 12px; border: 1px solid var(--line-strong); border-radius: var(--radius-xs); background: var(--surface); color: var(--ink); font-family: var(--display); font-size: 17px; text-transform: none; }
+.context-selectors { display: grid; grid-template-columns: repeat(2, minmax(220px, 1fr)); gap: 18px; margin-bottom: 30px; padding: 18px 20px; border: 1px solid var(--line); background: color-mix(in srgb, var(--surface) 88%, transparent); }
+.context-selectors .select-field select { width: 100%; }
+.ai-provider-section { align-items: flex-start !important; }
+.ai-config-form { width: min(100%, 620px); display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 16px; }
+.ai-config-form .field-wide, .ai-actions, .form-note { grid-column: 1 / -1; }
+.check-field { display: flex; align-items: center; gap: 10px; color: var(--muted); font-size: 13px; }
+.check-field input { accent-color: var(--ink); }
+.ai-actions { display: flex; flex-wrap: wrap; gap: 10px; padding-top: 8px; }
+.form-note { margin: -2px 0 0; color: var(--muted); font-family: var(--reading); font-size: 12px; line-height: 1.7; }
+.loading-page > .list-empty { min-height: 180px; display: grid; place-items: center; border: 1px solid var(--line); background: var(--surface); }
 .level-track { width: 100%; height: 8px; overflow: hidden; border: 1px solid var(--line); border-radius: 0; appearance: none; -webkit-appearance: none; background: var(--paper-deep); }
 .level-track::-webkit-progress-bar { background: var(--paper-deep); }
 .level-track::-webkit-progress-value { background: var(--accent); transition: width 90ms linear; }
@@ -3146,4 +3156,12 @@ button.marker-row {
   .mobile-nav {
     height: calc(64px + env(safe-area-inset-bottom));
   }
+}
+
+@media (max-width: 760px) {
+  .context-selectors,
+  .ai-config-form { grid-template-columns: 1fr; }
+
+  .ai-config-form .field-wide,
+  .ai-actions { grid-column: auto; }
 }

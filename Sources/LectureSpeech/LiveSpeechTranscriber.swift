@@ -34,6 +34,11 @@ public final class LiveSpeechTranscriber: @unchecked Sendable {
     private var finishing = false
     private var finishWaiters: [CheckedContinuation<Void, Never>] = []
     private var activeProcessCount = 0
+    private var samplesSinceDraft = 0
+    private var draftInFlight = false
+    private var latestDraftGeneration = 0
+    private var silenceSampleCount = 0
+    private var samplesSinceLastFinal = 0
 
     public init(
         vocabulary: [String],
@@ -68,6 +73,11 @@ public final class LiveSpeechTranscriber: @unchecked Sendable {
             processing = false
             running = true
             finishing = false
+            samplesSinceDraft = 0
+            draftInFlight = false
+            latestDraftGeneration = 0
+            silenceSampleCount = 0
+            samplesSinceLastFinal = 0
             return true
         }
         guard reserved else { throw LiveSpeechError.alreadyRunning }
@@ -80,15 +90,38 @@ public final class LiveSpeechTranscriber: @unchecked Sendable {
             let samples = try converter.convert(buffer)
             guard !samples.isEmpty else { return }
             var shouldSchedule = false
+            var draftWork: (samples: [Int16], startSample: Int64, lectureID: String, generation: Int, handler: UpdateHandler?)?
             stateLock.withLock {
                 guard running else { return }
                 pendingSamples.append(contentsOf: samples)
-                if !processing, pendingSamples.count >= chunkSampleCount {
+                samplesSinceDraft += samples.count
+                samplesSinceLastFinal += samples.count
+                silenceSampleCount = Self.hasSpeechEnergy(samples) ? 0 : silenceSampleCount + samples.count
+                if !draftInFlight, !processing, pendingSamples.count >= draftSampleCount, samplesSinceDraft >= draftSampleCount {
+                    let count = min(pendingSamples.count, chunkSampleCount)
+                    latestDraftGeneration += 1
+                    draftWork = (
+                        Array(pendingSamples.suffix(count)),
+                        pendingStartSample + Int64(pendingSamples.count - count),
+                        lectureID ?? "",
+                        latestDraftGeneration,
+                        handler
+                    )
+                    samplesSinceDraft = 0
+                    draftInFlight = true
+                }
+                let endedSentence = silenceSampleCount >= sentenceSilenceSampleCount
+                    && samplesSinceLastFinal >= minimumSentenceSampleCount
+                    && pendingSamples.count >= minimumSentenceSampleCount
+                if !processing && (pendingSamples.count >= chunkSampleCount || endedSentence) {
                     processing = true
+                    samplesSinceLastFinal = 0
+                    silenceSampleCount = 0
                     shouldSchedule = true
                 }
             }
             if shouldSchedule { scheduleNextChunk() }
+            if let draftWork { scheduleDraft(draftWork) }
         } catch {
             state.2?(error)
         }
@@ -146,8 +179,83 @@ public final class LiveSpeechTranscriber: @unchecked Sendable {
         max(1, Int(configuration.minimumFinalChunkDuration * WhisperAudioConverter.sampleRate))
     }
 
+    private var draftSampleCount: Int {
+        max(1, Int(configuration.draftDuration * WhisperAudioConverter.sampleRate))
+    }
+
+    private var sentenceSilenceSampleCount: Int {
+        Int(0.75 * WhisperAudioConverter.sampleRate)
+    }
+
+    private var minimumSentenceSampleCount: Int {
+        Int(1.2 * WhisperAudioConverter.sampleRate)
+    }
+
+    private static func hasSpeechEnergy(_ samples: [Int16]) -> Bool {
+        guard !samples.isEmpty else { return false }
+        let meanSquare = samples.reduce(into: 0.0) { total, sample in
+            let normalized = Double(sample) / Double(Int16.max)
+            total += normalized * normalized
+        } / Double(samples.count)
+        return sqrt(meanSquare) >= 0.006
+    }
+
     private func scheduleNextChunk() {
         workerQueue.async { [weak self] in self?.processNextChunk() }
+    }
+
+    private func scheduleDraft(
+        _ work: (samples: [Int16], startSample: Int64, lectureID: String, generation: Int, handler: UpdateHandler?)
+    ) {
+        workerQueue.async { [weak self] in self?.processDraft(work) }
+    }
+
+    private func processDraft(
+        _ work: (samples: [Int16], startSample: Int64, lectureID: String, generation: Int, handler: UpdateHandler?)
+    ) {
+        guard !work.lectureID.isEmpty else { stateLock.withLock { draftInFlight = false }; return }
+        let wavURL = configuration.workingDirectory
+            .appendingPathComponent("draft-\(UUID().uuidString).wav")
+        defer { try? FileManager.default.removeItem(at: wavURL) }
+        do {
+            try WhisperWAVWriter.data(samples: work.samples).write(to: wavURL, options: .atomic)
+            try FileManager.default.setAttributes(
+                [.posixPermissions: 0o600],
+                ofItemAtPath: wavURL.path
+            )
+            let offset = Double(work.startSample) / WhisperAudioConverter.sampleRate
+            let segments = try whisper.transcribe(
+                audioURL: wavURL,
+                lectureID: work.lectureID,
+                source: .liveEnglish,
+                vocabulary: vocabulary,
+                timeOffset: offset,
+                maximumDuration: Double(work.samples.count) / WhisperAudioConverter.sampleRate
+            )
+            let text = segments.map(\.text).joined(separator: " ")
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            stateLock.withLock { draftInFlight = false }
+            guard !text.isEmpty, let first = segments.first, let last = segments.last else { return }
+            let segment = TranscriptSegment(
+                id: "draft-\(work.lectureID)",
+                lectureID: work.lectureID,
+                source: .liveEnglish,
+                startTime: first.startTime,
+                endTime: last.endTime,
+                text: text,
+                isFinal: false
+            )
+            guard stateLock.withLock({ work.generation == latestDraftGeneration }) else { return }
+            work.handler?(TranscriptionUpdate(
+                segment: segment,
+                alternatives: [],
+                confidenceClassification: .unavailable,
+                kind: .draft
+            ))
+        } catch {
+            // Draft recognition is opportunistic. The final path reports errors.
+        }
+        stateLock.withLock { draftInFlight = false }
     }
 
     private func processNextChunk() {
@@ -157,6 +265,8 @@ public final class LiveSpeechTranscriber: @unchecked Sendable {
             let count: Int
             if pendingSamples.count >= chunkSampleCount {
                 count = chunkSampleCount
+            } else if !finishing, pendingSamples.count >= minimumSentenceSampleCount {
+                count = pendingSamples.count
             } else if finishing, pendingSamples.count >= minimumFinalSampleCount {
                 count = pendingSamples.count
             } else {
@@ -172,6 +282,7 @@ public final class LiveSpeechTranscriber: @unchecked Sendable {
             pendingSamples.removeFirst(count)
             let start = pendingStartSample
             pendingStartSample += Int64(count)
+            latestDraftGeneration += 1
             activeProcessCount += 1
             return (samples, start, lectureID, handler, errorHandler)
         }
@@ -218,6 +329,7 @@ public final class LiveSpeechTranscriber: @unchecked Sendable {
         stateLock.withLock {
             activeProcessCount = max(0, activeProcessCount - 1)
             if pendingSamples.count >= chunkSampleCount
+                || (!finishing && pendingSamples.count >= minimumSentenceSampleCount)
                 || (finishing && pendingSamples.count >= minimumFinalSampleCount) {
                 shouldContinue = true
             } else {
@@ -249,6 +361,11 @@ public final class LiveSpeechTranscriber: @unchecked Sendable {
             errorHandler = nil
             pendingSamples.removeAll(keepingCapacity: false)
             pendingStartSample = 0
+            samplesSinceDraft = 0
+            draftInFlight = false
+            latestDraftGeneration = 0
+            silenceSampleCount = 0
+            samplesSinceLastFinal = 0
             processing = false
             running = false
             finishing = false

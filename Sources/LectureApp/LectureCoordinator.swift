@@ -10,6 +10,7 @@ final class LectureCoordinator: LectureRuntimeControlling, @unchecked Sendable {
     private let paths: AppPaths
     private let recorder = MicrophoneRecorder()
     private let keychain = DeepSeekKeychainStore()
+    private let aiConfigurationStore: AIProviderConfigurationStore
     private let deepSeek: DeepSeekClient
     private let translation = AppleTranslationService()
     private let lock = NSLock()
@@ -24,13 +25,20 @@ final class LectureCoordinator: LectureRuntimeControlling, @unchecked Sendable {
     private var transition: LectureTransition?
     private var lastStoppedLecture: LectureRecord?
     private var retryingLectureIDs = Set<String>()
+    private var processingLectureIDs = Set<String>()
     private var audioLevelUpdatedAt: Date?
     private var speechAvailableValue = false
     private var translationAvailableValue = false
     private var deepSeekConfiguredValue = false
 
     init(repository: LectureRepository, paths: AppPaths, deepSeekConfigured: Bool = false) {
-        self.repository = repository; self.paths = paths; deepSeek = DeepSeekClient(keyProvider: keychain)
+        self.repository = repository
+        self.paths = paths
+        aiConfigurationStore = AIProviderConfigurationStore(url: paths.aiConfiguration)
+        deepSeek = DeepSeekClient(
+            keyProvider: keychain,
+            configurationProvider: aiConfigurationStore
+        )
         deepSeekConfiguredValue = deepSeekConfigured
         Task { [weak self] in
             guard let self else { return }
@@ -78,6 +86,19 @@ final class LectureCoordinator: LectureRuntimeControlling, @unchecked Sendable {
     }
 
     func isDeepSeekConfigured() -> Bool { withState { deepSeekConfiguredValue } }
+    func aiConfigurationStatus() throws -> AIProviderConfigurationStatus {
+        let configuration = try aiConfigurationStore.loadConfiguration()
+        let keyConfigured = configuration.requiresAPIKey ? keychain.hasAPIKeyReference() : true
+        return AIProviderConfigurationStatus(
+            configuration: configuration,
+            keyConfigured: keyConfigured
+        )
+    }
+    func saveAIConfiguration(_ configuration: AIProviderConfiguration) throws {
+        try aiConfigurationStore.saveConfiguration(configuration)
+        let keyConfigured = configuration.requiresAPIKey ? keychain.hasAPIKeyReference() : true
+        withState { deepSeekConfiguredValue = keyConfigured }
+    }
     var hasActiveLecture: Bool { withState { activeLecture != nil } }
     func storageUsage() throws -> LectureStorageUsage { try paths.storageUsage() }
     func openTranslationSettings() {
@@ -224,7 +245,8 @@ final class LectureCoordinator: LectureRuntimeControlling, @unchecked Sendable {
     func retryProcessing(lectureID: String) async throws {
         guard let lecture = try repository.lecture(id: lectureID), let course = try repository.course(id: lecture.courseID) else { throw CoordinatorError.missingLecture }
         let canRetry = withState { () -> Bool in
-            retryingLectureIDs.insert(lectureID).inserted
+            guard !processingLectureIDs.contains(lectureID) else { return false }
+            return retryingLectureIDs.insert(lectureID).inserted
         }
         guard canRetry else { throw CoordinatorError.busy }
         defer { _ = withState { retryingLectureIDs.remove(lectureID) } }
@@ -245,30 +267,41 @@ final class LectureCoordinator: LectureRuntimeControlling, @unchecked Sendable {
     }
 
     func saveDeepSeekKey(_ key: String) async throws {
-        let previous = try keychain.loadAPIKey()
+        let hadPreviousKey = keychain.hasAPIKeyReference()
         do {
             try keychain.saveAPIKey(key)
             _ = try await deepSeek.testConnection()
             withState { deepSeekConfiguredValue = true }
         } catch {
-            if let previous { try? keychain.saveAPIKey(previous) } else { try? keychain.deleteAPIKey() }
-            withState { deepSeekConfiguredValue = previous != nil }
+            // Keep an existing or newly saved key so a temporary network or
+            // provider error does not force the user to enter it again.
+            withState { deepSeekConfiguredValue = hadPreviousKey || keychain.hasAPIKeyReference() }
             throw error
         }
     }
-    func deleteDeepSeekKey() throws { try keychain.deleteAPIKey(); withState { deepSeekConfiguredValue = false } }
+    func deleteDeepSeekKey() throws {
+        try keychain.deleteAPIKey()
+        let needsKey = (try? aiConfigurationStore.loadConfiguration().requiresAPIKey) ?? true
+        withState { deepSeekConfiguredValue = !needsKey }
+    }
     func testDeepSeek() async throws -> Bool { try await deepSeek.testConnection().isConnected }
 
     private func receive(_ update: TranscriptionUpdate) {
-        if update.kind == .draft { withState { volatileEnglishValue = update.segment.text }; return }
+        if update.kind == .draft {
+            withState { volatileEnglishValue = update.segment.text }
+            return
+        }
         do { try repository.appendTranscript(update.segment) } catch { withState { statusMessageValue = "字幕保存失败：\(error)" } }
-        withState { volatileEnglishValue = "" }
+        withState {
+            volatileEnglishValue = ""
+            volatileChineseValue = ""
+        }
         Task { [weak self] in
             guard let self else { return }
             do {
                 let chinese = try await translation.translate(update.segment.text)
                 let segment = TranscriptSegment(lectureID: update.segment.lectureID, source: .liveChinese, startTime: update.segment.startTime, endTime: update.segment.endTime, text: chinese, isFinal: true, sourceSegmentID: update.segment.id)
-                try repository.appendTranscript(segment); withState { self.volatileChineseValue = chinese }
+                try repository.appendTranscript(segment)
             } catch {
                 let message = AppleTranslationService.userMessage(for: error)
                 withState {
@@ -281,27 +314,37 @@ final class LectureCoordinator: LectureRuntimeControlling, @unchecked Sendable {
 
     private func processAfterClass(lecture original: LectureRecord, course: Course?) async {
         var lecture = original
+        let reserved = withState { processingLectureIDs.insert(lecture.id).inserted }
+        guard reserved else { return }
+        defer { _ = withState { processingLectureIDs.remove(lecture.id) } }
         do {
             guard let path = lecture.audioPath else { throw CoordinatorError.missingAudio }
             let live = try repository.transcripts(lectureID: lecture.id, source: .liveEnglish)
             let existingReviewed = try repository.transcripts(lectureID: lecture.id, source: .reviewedEnglish)
-            let reviewed: [TranscriptSegment]
+            var reviewed = existingReviewed
+            var reviewWarning: String?
             if existingReviewed.isEmpty {
                 if lecture.status != .reviewingEnglish { lecture.status = .reviewingEnglish; lecture.updatedAt = Date(); try repository.upsertLecture(lecture) }
-                reviewed = try WhisperCLI().transcribeAudioFile(
-                    audioURL: URL(fileURLWithPath: path),
-                    lectureID: lecture.id,
-                    source: .reviewedEnglish,
-                    vocabulary: course?.vocabulary ?? []
-                )
-                guard !reviewed.isEmpty else { throw CoordinatorError.emptyTranscript }
-                for segment in reviewed { try repository.appendTranscript(segment) }
-            } else {
-                reviewed = existingReviewed
+                do {
+                    reviewed = try WhisperCLI().transcribeAudioFile(
+                        audioURL: URL(fileURLWithPath: path),
+                        lectureID: lecture.id,
+                        source: .reviewedEnglish,
+                        vocabulary: course?.vocabulary ?? []
+                    )
+                    for segment in reviewed { try repository.appendTranscript(segment) }
+                } catch {
+                    guard !live.isEmpty else { throw error }
+                    reviewWarning = SecretRedactor.redact(String(describing: error))
+                    reviewed = []
+                }
             }
-            lecture.status = .processingDeepSeek; lecture.updatedAt = Date(); try repository.upsertLecture(lecture)
             let base = TranscriptPreference.english(live: live, reviewed: reviewed)
-            if (try? keychain.loadAPIKey()) != nil {
+            guard !base.isEmpty else { throw CoordinatorError.emptyTranscript }
+            lecture.status = .processingDeepSeek; lecture.updatedAt = Date(); try repository.upsertLecture(lecture)
+            let aiConfiguration = try aiConfigurationStore.loadConfiguration()
+            var aiWarning: String?
+            if !aiConfiguration.requiresAPIKey || keychain.hasAPIKeyReference() {
                 var translationWarning: String?
                 do {
                     for segment in try await deepSeek.correctTranslation(englishSegments: base, vocabulary: course?.vocabulary ?? []) {
@@ -310,16 +353,34 @@ final class LectureCoordinator: LectureRuntimeControlling, @unchecked Sendable {
                 } catch {
                     translationWarning = SecretRedactor.redact(String(describing: error))
                 }
-                let summary = try await deepSeek.generateStudySummary(lectureTitle: lecture.title, transcript: base)
-                try repository.appendSummary(.init(lectureID: lecture.id, content: summary))
-                if translationWarning != nil {
+                do {
+                    let summary = try await deepSeek.generateStudySummary(lectureTitle: lecture.title, transcript: base)
+                    try repository.appendSummary(.init(lectureID: lecture.id, content: summary))
+                } catch {
+                    aiWarning = SecretRedactor.redact(String(describing: error))
+                }
+                if translationWarning != nil, aiWarning == nil {
                     withState { statusMessageValue = "总结已完成；中文校正暂时沿用实时翻译" }
                 }
             }
-            lecture.status = .completed; lecture.errorMessage = nil
+            if let aiWarning {
+                lecture.status = .failed
+                lecture.errorMessage = "英文逐字稿已保留；AI 总结失败：\(aiWarning)"
+            } else {
+                lecture.status = .completed
+                lecture.errorMessage = reviewWarning.map { "完整录音复核失败，已保留并使用实时英文稿：\($0)" }
+            }
         } catch { lecture.status = .failed; lecture.errorMessage = SecretRedactor.redact(String(describing: error)) }
         lecture.updatedAt = Date(); try? repository.upsertLecture(lecture)
-        withState { statusMessageValue = lecture.status == .completed ? "课后复核与总结已完成" : "课后处理可在历史记录中重试" }
+        withState {
+            if lecture.status == .completed {
+                statusMessageValue = lecture.errorMessage == nil
+                    ? "课后复核与总结已完成"
+                    : "课后总结已完成；完整复核失败时已自动保留实时英文稿"
+            } else {
+                statusMessageValue = "英文逐字稿仍可使用；AI 或课后处理可在历史记录中重试"
+            }
+        }
     }
 
     private func setAudioLevel(_ value: Double) {

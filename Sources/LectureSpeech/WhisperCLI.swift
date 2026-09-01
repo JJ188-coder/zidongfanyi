@@ -171,6 +171,11 @@ public final class WhisperCLI: @unchecked Sendable {
         )
     }
 
+    public var usesVoiceActivityDetection: Bool {
+        guard let vadModelURL = configuration.vadModelURL else { return false }
+        return fileManager.fileExists(atPath: vadModelURL.path)
+    }
+
     public func cancel() {
         processLock.lock()
         let process = activeProcess
@@ -223,6 +228,19 @@ public final class WhisperCLI: @unchecked Sendable {
         ]
         let prompt = prompt(from: vocabulary)
         if !prompt.isEmpty { values.append(contentsOf: ["--prompt", prompt]) }
+        if let vadModelURL = configuration.vadModelURL,
+           fileManager.fileExists(atPath: vadModelURL.path) {
+            values.append(contentsOf: [
+                "--vad",
+                "--vad-model", vadModelURL.path,
+                "--vad-threshold", "0.35",
+                "--vad-min-speech-duration-ms", "180",
+                "--vad-min-silence-duration-ms", "700",
+                "--vad-max-speech-duration-s", "18",
+                "--vad-speech-pad-ms", "220",
+                "--vad-samples-overlap", "0.25",
+            ])
+        }
         values.append(audioURL.path)
         return values
     }

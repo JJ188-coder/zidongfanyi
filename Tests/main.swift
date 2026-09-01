@@ -50,6 +50,11 @@ func testTranscriptPreference() throws {
         TranscriptSegment(id: "reviewed-" + segment.id, lectureID: segment.lectureID, source: .reviewedEnglish, startTime: segment.startTime, endTime: segment.endTime, text: segment.text + " reviewed", isFinal: true)
     }
     try expect(TranscriptPreference.english(live: live, reviewed: completeReview) == completeReview, "a complete review should remain preferred")
+    let liveChinese = live.map { segment in
+        TranscriptSegment(id: "zh-" + segment.id, lectureID: segment.lectureID, source: .liveChinese, startTime: segment.startTime, endTime: segment.endTime, text: "实时翻译", isFinal: true, sourceSegmentID: segment.id)
+    }
+    let partialCorrected = [TranscriptSegment(id: "corrected-one", lectureID: "lecture", source: .correctedChinese, startTime: 0, endTime: 6, text: "局部校正", isFinal: true, sourceSegmentID: live[0].id)]
+    try expect(TranscriptPreference.chinese(live: liveChinese, corrected: partialCorrected, preferredEnglish: live) == liveChinese, "partial AI translation must not replace a complete live translation")
 }
 
 func testAppPaths() throws {
@@ -57,7 +62,7 @@ func testAppPaths() throws {
     let paths = AppPaths(root: root)
     defer { try? FileManager.default.removeItem(at: root) }
     try paths.createDirectories()
-    for directory in [paths.root, paths.recordings, paths.exports, paths.working, paths.speechModels] {
+    for directory in [paths.root, paths.recordings, paths.exports, paths.working, paths.speechModels, paths.whisper, paths.whisperWorking] {
         let permissions = try FileManager.default.attributesOfItem(atPath: directory.path)[.posixPermissions] as? NSNumber
         try expect(permissions?.intValue == 0o700, "private app directory should use owner-only permissions")
     }
@@ -67,6 +72,10 @@ func testAppPaths() throws {
     let legacyRecording = paths.recordings.appendingPathComponent("legacy-recording.m4a")
     try Data("legacy".utf8).write(to: legacyRecording)
     try FileManager.default.setAttributes([.posixPermissions: 0o644], ofItemAtPath: legacyRecording.path)
+    try Data([4]).write(to: paths.whisperVADModel)
+    try FileManager.default.setAttributes([.posixPermissions: 0o644], ofItemAtPath: paths.whisperVADModel.path)
+    try Data([5]).write(to: paths.whisperQualityModel)
+    try FileManager.default.setAttributes([.posixPermissions: 0o644], ofItemAtPath: paths.whisperQualityModel.path)
     try paths.createDirectories()
     for file in [paths.database, paths.database.appendingPathExtension("wal"), paths.database.appendingPathExtension("shm")] {
         let permissions = try FileManager.default.attributesOfItem(atPath: file.path)[.posixPermissions] as? NSNumber
@@ -74,6 +83,10 @@ func testAppPaths() throws {
     }
     let recordingPermissions = try FileManager.default.attributesOfItem(atPath: legacyRecording.path)[.posixPermissions] as? NSNumber
     try expect(recordingPermissions?.intValue == 0o600, "existing recordings should be migrated to owner-only permissions")
+    let vadPermissions = try FileManager.default.attributesOfItem(atPath: paths.whisperVADModel.path)[.posixPermissions] as? NSNumber
+    try expect(vadPermissions?.intValue == 0o600, "the local VAD model should use owner-only permissions")
+    let qualityModelPermissions = try FileManager.default.attributesOfItem(atPath: paths.whisperQualityModel.path)[.posixPermissions] as? NSNumber
+    try expect(qualityModelPermissions?.intValue == 0o600, "the higher-quality Whisper model should use owner-only permissions")
     try expect(paths.audioURL(lectureID: "unsafe/id").lastPathComponent == "unsafe-id.m4a", "recording paths should sanitize identifiers")
 
     try Data([1, 2, 3, 4]).write(to: paths.exports.appendingPathComponent("notes.md"))
@@ -235,6 +248,10 @@ func testStructuredResponseParsing() throws {
     try expect(flexibleSummary.professorExamples == ["Coffee and tea"], "single summary strings should normalize into one bullet")
     try expect(flexibleSummary.unresolvedQuestions.isEmpty, "null summary sections should normalize to empty lists")
     try expect(flexibleSummary.glossary == [GlossaryTerm(english: "Hicksian demand", chinese: "希克斯需求")], "glossary dictionaries should normalize into terms")
+    let nestedSummary = try DeepSeekResponseParser.studySummary(from: #"{"overview":"Nested response","coreConcepts":[{"Market power":"ability to raise price"}],"definitions":{"elasticity":1.5},"professorExamples":[],"professorEmphasis":[],"possibleExamTopics":[],"unresolvedQuestions":[],"glossary":[{"term":"markup","translation":"加成","definition":"price over marginal cost"}]}"#)
+    try expect(nestedSummary.coreConcepts == ["Market power：ability to raise price"], "object list fields should normalize instead of failing a completed lecture")
+    try expect(nestedSummary.definitions == ["elasticity：1.5"], "numeric dictionary values should normalize instead of failing a completed lecture")
+    try expect(nestedSummary.glossary.first?.english == "markup" && nestedSummary.glossary.first?.chinese == "加成", "alternate glossary field names should normalize")
 
     let evidence = [
         GroundingEvidence(id: "ev-1", lectureID: "lecture-1", lectureTitle: "Consumer Choice", segmentID: "s1", startTime: 96, endTime: 104, text: "The MRS diminishes along a convex indifference curve."),
@@ -313,6 +330,11 @@ struct StaticAPIKeyProvider: DeepSeekAPIKeyProviding {
     func loadAPIKey() throws -> String? { value }
 }
 
+struct StaticAIConfigurationProvider: AIProviderConfigurationProviding {
+    let value: AIProviderConfiguration
+    func loadConfiguration() throws -> AIProviderConfiguration { value }
+}
+
 func makeStubbedSession() -> URLSession {
     let configuration = URLSessionConfiguration.ephemeral
     configuration.protocolClasses = [StubURLProtocol.self]
@@ -331,7 +353,11 @@ func testDeepSeekRequestShapeAndRedaction() async throws {
     StubURLProtocol.reset()
     let key = "sk-test-request-shape-1234567890"
     StubURLProtocol.enqueue(body: try completionEnvelope(content: "OK"))
-    let client = DeepSeekClient(keyProvider: StaticAPIKeyProvider(value: key), session: makeStubbedSession())
+    let client = DeepSeekClient(
+        keyProvider: StaticAPIKeyProvider(value: key),
+        configurationProvider: StaticAIConfigurationProvider(value: .deepSeekV4Flash),
+        session: makeStubbedSession()
+    )
     let status = try await client.testConnection()
     try expect(status.isConnected, "connectivity response should report success")
 
@@ -348,7 +374,7 @@ func testDeepSeekRequestShapeAndRedaction() async throws {
     guard let body, let json = try JSONSerialization.jsonObject(with: body) as? [String: Any] else {
         throw TestFailure(description: "DeepSeek request body should be JSON")
     }
-    try expect(json["model"] as? String == "deepseek-v4-pro", "client should use the product-level DeepSeek model")
+    try expect(json["model"] as? String == "deepseek-v4-flash", "client should default to DeepSeek V4 Flash")
     try expect(json["stream"] as? Bool == false, "core workflows should request a non-stream response")
     try expect((json["thinking"] as? [String: Any])?["type"] as? String == "disabled", "structured workflows should disable thinking output")
 
@@ -373,7 +399,11 @@ func testDeepSeekWorkflows() async throws {
     StubURLProtocol.enqueue(body: try completionEnvelope(content: summary))
     StubURLProtocol.enqueue(body: try completionEnvelope(content: #"{"answer":"教授说边际替代率沿凸无差异曲线递减。","foundEvidence":true,"citedEvidenceIDs":["ev-1"]}"#))
 
-    let client = DeepSeekClient(keyProvider: StaticAPIKeyProvider(value: "sk-test-workflow-1234567890"), session: makeStubbedSession())
+    let client = DeepSeekClient(
+        keyProvider: StaticAPIKeyProvider(value: "sk-test-workflow-1234567890"),
+        configurationProvider: StaticAIConfigurationProvider(value: .deepSeekV4Flash),
+        session: makeStubbedSession()
+    )
     let segment = TranscriptSegment(id: "seg-1", lectureID: "lecture-1", source: .reviewedEnglish, startTime: 10, endTime: 16, text: "The marginal rate of substitution diminishes.", isFinal: true)
     let corrected = try await client.correctTranslation(englishSegments: [segment], vocabulary: ["marginal rate of substitution"])
     try expect(corrected.count == 1 && corrected[0].text == "边际替代率递减。", "translation correction should retain parsed Chinese text")
@@ -388,6 +418,72 @@ func testDeepSeekWorkflows() async throws {
     try expect(StubURLProtocol.requests().count == 3, "each workflow should make one focused request for a short transcript")
 }
 
+func testOpenAICompatibleRequestShape() async throws {
+    StubURLProtocol.reset()
+    StubURLProtocol.enqueue(body: try completionEnvelope(content: "OK"))
+    let configuration = AIProviderConfiguration(
+        name: "Local test",
+        baseURL: "http://127.0.0.1:11434/v1",
+        model: "qwen-test",
+        providerKind: .local,
+        requiresAPIKey: false,
+        supportsJSONResponseFormat: false
+    )
+    let client = DeepSeekClient(
+        keyProvider: StaticAPIKeyProvider(value: nil),
+        configurationProvider: StaticAIConfigurationProvider(value: configuration),
+        session: makeStubbedSession()
+    )
+    _ = try await client.testConnection()
+    guard let request = StubURLProtocol.requests().first else {
+        throw TestFailure(description: "custom AI request missing")
+    }
+    let body = request.httpBody ?? request.httpBodyStream.flatMap { stream -> Data? in
+        stream.open(); defer { stream.close() }
+        var data = Data(); var buffer = [UInt8](repeating: 0, count: 4096)
+        while stream.hasBytesAvailable { let count = stream.read(&buffer, maxLength: buffer.count); if count <= 0 { break }; data.append(buffer, count: count) }
+        return data
+    }
+    guard let body, let json = try JSONSerialization.jsonObject(with: body) as? [String: Any] else {
+        throw TestFailure(description: "custom AI request body missing")
+    }
+    try expect(request.url?.absoluteString == "http://127.0.0.1:11434/v1/chat/completions", "local OpenAI-compatible endpoint should append chat/completions")
+    try expect(request.value(forHTTPHeaderField: "Authorization") == nil, "keyless local service should omit authorization")
+    try expect(json["model"] as? String == "qwen-test", "custom model should be used verbatim")
+    try expect(json["thinking"] == nil && json["response_format"] == nil, "provider-specific fields should be omitted when disabled")
+
+    do {
+        _ = try AIProviderConfiguration(
+            name: "Unsafe",
+            baseURL: "http://example.com/v1",
+            model: "model"
+        ).validated()
+        throw TestFailure(description: "remote HTTP AI URL must be rejected")
+    } catch is AIProviderConfigurationError {
+        // Expected.
+    }
+}
+
+func testAIProviderConfigurationPersistence() throws {
+    let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+    defer { try? FileManager.default.removeItem(at: root) }
+    let url = root.appendingPathComponent("ai-provider.json")
+    let store = AIProviderConfigurationStore(url: url)
+    try expect(try store.loadConfiguration() == .deepSeekV4Flash, "new installations should default to DeepSeek V4 Flash")
+    let custom = AIProviderConfiguration(
+        name: "Custom provider",
+        baseURL: "https://example.test/v1",
+        model: "custom-model",
+        providerKind: .openAICompatible
+    )
+    try store.saveConfiguration(custom)
+    try expect(try store.loadConfiguration() == custom, "custom compatible provider settings should survive reload")
+    let permissions = try FileManager.default.attributesOfItem(atPath: url.path)[.posixPermissions] as? NSNumber
+    try expect(permissions?.intValue == 0o600, "AI provider settings should remain private")
+    let text = try String(contentsOf: url, encoding: .utf8).lowercased()
+    try expect(!text.contains("api key") && !text.contains("authorization"), "provider settings must not contain credentials")
+}
+
 func testDeepSeekTranslationRetrySafety() async throws {
     StubURLProtocol.reset()
     let response = try completionEnvelope(
@@ -397,6 +493,7 @@ func testDeepSeekTranslationRetrySafety() async throws {
     StubURLProtocol.enqueue(body: response)
     let client = DeepSeekClient(
         keyProvider: StaticAPIKeyProvider(value: "sk-test-retry-safety-1234567890"),
+        configurationProvider: StaticAIConfigurationProvider(value: .deepSeekV4Flash),
         session: makeStubbedSession()
     )
     let segment = TranscriptSegment(
@@ -437,6 +534,7 @@ func testDeepSeekRejectsEmptySummaryInput() async throws {
     StubURLProtocol.reset()
     let client = DeepSeekClient(
         keyProvider: StaticAPIKeyProvider(value: "sk-test-empty-summary-1234567890"),
+        configurationProvider: StaticAIConfigurationProvider(value: .deepSeekV4Flash),
         session: makeStubbedSession()
     )
     do {
@@ -533,6 +631,15 @@ func testServerRouter() async throws {
     try expect(unauthorized.status == 401, "server must require session token")
     let health = await router.handle(HTTPRequest(method: "GET", path: "/api/health", headers: ["x-lecture-token": "secret-token"]))
     try expect(health.status == 200, "authorized health request")
+    let aiConfig = await router.handle(HTTPRequest(method: "GET", path: "/api/ai/config", headers: ["x-lecture-token": "secret-token"]))
+    try expect(aiConfig.status == 200, "AI configuration should be readable without exposing a key")
+    let savedAIConfig = await router.handle(HTTPRequest(
+        method: "PUT",
+        path: "/api/ai/config",
+        headers: ["x-lecture-token": "secret-token"],
+        body: try LectureJSON.encoder.encode(AIProviderConfiguration.local)
+    ))
+    try expect(savedAIConfig.status == 200, "OpenAI-compatible AI configuration should be writable")
     let storage = await router.handle(HTTPRequest(method: "GET", path: "/api/storage", headers: ["x-lecture-token": "secret-token"]))
     try expect(storage.status == 200 && storage.headers["Content-Type"] == "application/json; charset=utf-8", "storage diagnostics should be available to the local page")
     let page = await router.handle(HTTPRequest(method: "GET", path: "/", query: ["token": "secret-token"]))
@@ -605,11 +712,13 @@ func testWebSecurityContract() throws {
     try expect(appJavaScript.contains("正在准备…"), "long-running start should show visible progress")
     try expect(appJavaScript.contains("control.disabled = true"), "long-running controls should prevent duplicate requests")
     try expect(
-        appJavaScript.contains("const newestFirst = values => values.slice(-120).reverse()")
+        appJavaScript.contains("function transcriptWindow(values)")
+            && appJavaScript.contains("sort((a, b) => Number(a.startTime) - Number(b.startTime))")
             && appJavaScript.contains("captureStreamPositions()")
             && appJavaScript.contains("anchor.offsetTop - previous.anchorOffset")
+            && appJavaScript.contains("previous.wasNearBottom")
             && appJavaScript.contains("restoreStreamPositions(preservedStreams)"),
-        "live transcripts should show newest items first without moving a reader who scrolled into older text"
+        "live transcripts should run top-to-bottom, follow the bottom, and preserve an older reading anchor"
     )
     try expect(
         appJavaScript.contains("state.runtime.receivingAudio === false")
@@ -627,6 +736,18 @@ func testWebSecurityContract() throws {
     try expect(
         appJavaScript.contains("const targetHash = `#${route}`") && appJavaScript.contains("if (location.hash !== targetHash)"),
         "route changes should render once through hashchange instead of racing duplicate detail renders"
+    )
+    try expect(
+        appJavaScript.contains("routeRenderGeneration")
+            && appJavaScript.contains("renderIsCurrent(generation, route)")
+            && appJavaScript.contains("state.detailRequest += 1"),
+        "stale course, lecture, summary, detail, and Q&A responses must not overwrite a newer selection"
+    )
+    try expect(
+        appJavaScript.contains("updateStreamElements(stream, segments, draft, language)")
+            && appJavaScript.contains("stream.insertBefore")
+            && appJavaScript.contains("node.querySelector(\"p\").textContent = draft"),
+        "live draft refreshes should update the existing stream instead of rebuilding the scroll container"
     )
     try expect(
         appJavaScript.contains("state.pendingAudioTime = null; audio.play()"),
@@ -667,6 +788,23 @@ func testWebSecurityContract() throws {
             && coordinatorSource.contains("lastStoppedLecture?.id == requestedLectureID"),
         "recording state must survive a quiet input stream and duplicate stop calls must return the same lecture"
     )
+    try expect(
+        coordinatorSource.contains("guard !live.isEmpty else { throw error }")
+            && coordinatorSource.contains("let base = TranscriptPreference.english(live: live, reviewed: reviewed)")
+            && coordinatorSource.contains("processingLectureIDs"),
+        "post-class review must preserve a usable live transcript and avoid duplicate background work"
+    )
+
+    let whisperSource = try String(
+        contentsOf: projectRoot.appendingPathComponent("Sources/LectureSpeech/WhisperCLI.swift"),
+        encoding: .utf8
+    )
+    try expect(
+        whisperSource.contains("--vad-model")
+            && whisperSource.contains("--vad-min-silence-duration-ms")
+            && whisperSource.contains("0.35"),
+        "Whisper should use the local Silero VAD model with a classroom-friendly threshold when installed"
+    )
 
     let appSource = try String(
         contentsOf: projectRoot.appendingPathComponent("Sources/LectureApp/main.swift"),
@@ -693,6 +831,8 @@ let tests: [(String, () async throws -> Void)] = [
     ("structured parsing", { try testStructuredResponseParsing() }),
     ("DeepSeek request and redaction", testDeepSeekRequestShapeAndRedaction),
     ("DeepSeek workflows", testDeepSeekWorkflows),
+    ("OpenAI-compatible request", testOpenAICompatibleRequestShape),
+    ("AI provider persistence", { try testAIProviderConfigurationPersistence() }),
     ("DeepSeek translation retry safety", testDeepSeekTranslationRetrySafety),
     ("DeepSeek empty summary safety", testDeepSeekRejectsEmptySummaryInput),
     ("server router", testServerRouter),

@@ -8,6 +8,8 @@ public protocol LectureRuntimeControlling: Sendable {
     func addMarker(label: String?) throws -> LectureMarker
     func retryProcessing(lectureID: String) async throws
     func answer(question: String, courseID: String, lectureID: String?) async throws -> ChatMessage
+    func aiConfigurationStatus() throws -> AIProviderConfigurationStatus
+    func saveAIConfiguration(_ configuration: AIProviderConfiguration) throws
     func saveDeepSeekKey(_ key: String) async throws
     func deleteDeepSeekKey() throws
     func testDeepSeek() async throws -> Bool
@@ -20,6 +22,13 @@ public extension LectureRuntimeControlling {
     func reviewedTranscript(lectureID: String) async throws -> [TranscriptSegment] { [] }
     func storageUsage() throws -> LectureStorageUsage { LectureStorageUsage() }
     func openTranslationSettings() {}
+    func aiConfigurationStatus() throws -> AIProviderConfigurationStatus {
+        AIProviderConfigurationStatus(
+            configuration: .deepSeekV4Flash,
+            keyConfigured: isDeepSeekConfigured()
+        )
+    }
+    func saveAIConfiguration(_ configuration: AIProviderConfiguration) throws {}
 }
 
 public struct RuntimeSnapshot: Codable, Sendable {
@@ -96,6 +105,22 @@ public final class LectureAPIRouter: @unchecked Sendable {
             return .json(snapshot)
         case ("GET", "/api/storage"):
             return .json(try runtime.storageUsage())
+        case ("GET", "/api/ai/config"):
+            return .json(try runtime.aiConfigurationStatus())
+        case ("PUT", "/api/ai/config"):
+            let configuration = try decode(AIProviderConfiguration.self, from: request.body)
+            try runtime.saveAIConfiguration(configuration)
+            return .json(try runtime.aiConfigurationStatus())
+        case ("POST", "/api/ai/key"):
+            struct Input: Decodable { let apiKey: String }
+            let input = try decode(Input.self, from: request.body)
+            try await runtime.saveDeepSeekKey(input.apiKey)
+            return .json(["ok": true])
+        case ("DELETE", "/api/ai/key"):
+            try runtime.deleteDeepSeekKey()
+            return .json(["ok": true])
+        case ("POST", "/api/ai/test"):
+            return .json(["ok": try await runtime.testDeepSeek()])
         case ("GET", "/api/courses"):
             let query = request.query["q"]?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
             return .json(query.isEmpty ? try repository.listCourses() : try repository.searchCourses(query: query))

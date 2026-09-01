@@ -55,10 +55,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             let repository = try SQLiteLectureRepository(databaseURL: paths.database)
             try paths.createDirectories()
             recoverInterruptedLectures(repository)
+            let aiConfiguration = (try? AIProviderConfigurationStore(
+                url: paths.aiConfiguration
+            ).loadConfiguration()) ?? .deepSeekV4Flash
             let coordinator = LectureCoordinator(
                 repository: repository,
                 paths: paths,
-                deepSeekConfigured: DeepSeekKeychainStore().hasAPIKeyReference()
+                deepSeekConfigured: !aiConfiguration.requiresAPIKey
+                    || DeepSeekKeychainStore().hasAPIKeyReference()
             )
             let resourceRoot = Self.webResourceRoot()
             let server = LoopbackHTTPServer { token in

@@ -9,6 +9,7 @@ final class SmokeState: @unchecked Sendable {
     private var errors: [String] = []
 
     func append(_ segment: TranscriptSegment) {
+        guard segment.isFinal else { return }
         lock.withLock { segments.append(segment) }
     }
 

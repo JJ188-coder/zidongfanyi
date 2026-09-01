@@ -46,6 +46,7 @@ public func testLectureSpeech() throws {
     try testWhisperAudioConversion()
     try testRecorderEncodingSettings()
     try testWhisperWAVAndTranscriptParsing()
+    try testWhisperHallucinationFiltering()
     try testWhisperFileSmoke()
     try testLectureEnglishLocaleResolution()
     try testAudioLevels()
@@ -247,6 +248,17 @@ private func testWhisperWAVAndTranscriptParsing() throws {
     try speechExpectClose(segments[0].startTime, 11.2, "Whisper start timestamp")
     try speechExpectClose(segments[0].endTime, 12, "Whisper end timestamp should be clamped to audio")
     try speechExpect(segments[0].source == .reviewedEnglish, "Whisper source should be retained")
+}
+
+private func testWhisperHallucinationFiltering() throws {
+    let json = #"{"transcription":[{"offsets":{"from":0,"to":1000},"text":"Thanks for watching."},{"offsets":{"from":1000,"to":1400},"text":"The"},{"offsets":{"from":1400,"to":2200},"text":"The theorem follows."}]}"#
+    let items = try WhisperTranscriptParser.parse(Data(json.utf8))
+    let segments = WhisperTranscriptParser.segments(
+        from: items,
+        lectureID: "hallucination-filter",
+        source: .reviewedEnglish
+    )
+    try speechExpect(segments.map(\.text) == ["The theorem follows."], "known silence hallucinations should not enter the lecture timeline")
 }
 
 private func testWhisperFileSmoke() throws {

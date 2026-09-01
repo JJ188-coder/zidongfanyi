@@ -3,11 +3,16 @@
 
   const token = new URLSearchParams(location.search).get("token") || sessionStorage.getItem("lecture.token") || "";
   if (token) sessionStorage.setItem("lecture.token", token);
+  const savedSelection = (() => {
+    try { return JSON.parse(localStorage.getItem("lecture.selection") || "{}"); } catch { return {}; }
+  })();
   const state = {
     route: location.hash.slice(1) || "live",
-    courses: [], lectures: [], currentCourseID: null, currentLectureID: null,
+    courses: [], lectures: [], currentCourseID: savedSelection.courseID || null, currentLectureID: savedSelection.lectureID || null,
     runtime: { recording: false, duration: 0, audioLevel: 0, volatileEnglish: "", volatileChinese: "", deepSeekConfigured: false },
-    detail: null, chat: [], qaScope: "course", connected: false, pendingAudioTime: null,
+    detail: null, chat: [], qaScope: savedSelection.qaScope || "lecture", connected: false, pendingAudioTime: null,
+    ai: { configuration: null, keyConfigured: false, presets: [] },
+    detailRequest: 0, runtimeRequest: 0, routeRenderGeneration: 0,
     storage: { totalBytes: 0, recordingBytes: 0, databaseBytes: 0, exportBytes: 0, recordingCount: 0 }
   };
   const main = document.getElementById("app-main");
@@ -52,8 +57,46 @@
   }
   function icon(name) { return `<svg aria-hidden="true"><use href="#icon-${name}"></use></svg>`; }
   function button(label, action, kind = "button-quiet", disabled = false) { return `<button class="button ${kind}" data-action="${action}" ${disabled ? "disabled" : ""}>${escapeHTML(label)}</button>`; }
-  function course() { return state.courses.find(c => c.id === state.currentCourseID) || state.courses[0]; }
+  function course() { return state.courses.find(c => c.id === state.currentCourseID) || null; }
+  function lecturesForCourse(courseID = state.currentCourseID) { return state.lectures.filter(l => l.courseID === courseID); }
+  function selectedLecture() { return state.lectures.find(l => l.id === state.currentLectureID) || null; }
+  function persistSelection() {
+    localStorage.setItem("lecture.selection", JSON.stringify({ courseID: state.currentCourseID, lectureID: state.currentLectureID, qaScope: state.qaScope }));
+  }
+  function selectCourse(courseID, { chooseLatestLecture = true } = {}) {
+    if (!state.courses.some(c => c.id === courseID)) return false;
+    state.currentCourseID = courseID;
+    const available = lecturesForCourse(courseID);
+    if (!available.some(l => l.id === state.currentLectureID)) state.currentLectureID = chooseLatestLecture ? available[0]?.id || null : null;
+    state.detailRequest += 1;
+    state.detail = state.detail?.lecture?.id === state.currentLectureID ? state.detail : null;
+    state.chat = [];
+    persistSelection();
+    return true;
+  }
+  function selectLecture(lectureID) {
+    const lecture = state.lectures.find(l => l.id === lectureID);
+    if (!lecture) return false;
+    state.currentLectureID = lecture.id; state.currentCourseID = lecture.courseID;
+    state.detailRequest += 1;
+    state.detail = state.detail?.lecture?.id === lecture.id ? state.detail : null;
+    state.chat = [];
+    persistSelection();
+    return true;
+  }
+  async function loadSelectedDetail() {
+    if (!state.currentLectureID) { state.detail = null; return null; }
+    const requestID = ++state.detailRequest; const lectureID = state.currentLectureID;
+    const detail = await api(`/api/lectures/${lectureID}`);
+    if (requestID !== state.detailRequest || lectureID !== state.currentLectureID) return null;
+    state.detail = detail; return detail;
+  }
+  function selectorHTML({ includeLecture = true } = {}) {
+    const lectures = lecturesForCourse();
+    return `<div class="context-selectors"><label class="select-field"><span>课程</span><select data-select="course">${state.courses.map(c => `<option value="${c.id}" ${c.id === state.currentCourseID ? "selected" : ""}>${escapeHTML(c.name)}${c.code ? ` · ${escapeHTML(c.code)}` : ""}</option>`).join("")}</select></label>${includeLecture ? `<label class="select-field"><span>具体课堂录音</span><select data-select="lecture" ${lectures.length ? "" : "disabled"}>${lectures.length ? lectures.map(l => `<option value="${l.id}" ${l.id === state.currentLectureID ? "selected" : ""}>${escapeHTML(l.title)} · ${date(l.startedAt)}</option>`).join("") : `<option>这门课还没有录音</option>`}</select></label>` : ""}</div>`;
+  }
   async function refreshStorage() { try { state.storage = await api("/api/storage"); } catch {} }
+  async function refreshAIConfiguration() { try { state.ai = await api("/api/ai/config"); } catch {} }
 
   function toast(message, danger = false) {
     const region = document.getElementById("toast-region"); const node = document.createElement("div");
@@ -72,31 +115,93 @@
   async function bootstrap() {
     try {
       await api("/api/health"); state.connected = true;
-      state.courses = await api("/api/courses"); state.currentCourseID ||= state.courses[0]?.id || null;
+      state.courses = await api("/api/courses");
       state.lectures = await api("/api/lectures"); state.runtime = await api("/api/state");
-      await refreshStorage();
-      if (state.runtime.activeLectureID) { state.currentLectureID = state.runtime.activeLectureID; state.detail = await api(`/api/lectures/${state.runtime.activeLectureID}`); }
+      await Promise.all([refreshStorage(), refreshAIConfiguration()]);
+      if (state.runtime.activeLectureID) selectLecture(state.runtime.activeLectureID);
+      else if (!selectLecture(state.currentLectureID)) {
+        if (!selectCourse(state.currentCourseID)) selectCourse(state.courses[0]?.id || null);
+      }
+      if (state.currentLectureID) await loadSelectedDetail();
       modeNote.textContent = "LOCAL · 127.0.0.1"; document.getElementById("local-state").innerHTML = `<span class="state-lamp"></span><span>本机服务已连接</span>`;
     } catch (error) { state.connected = false; modeNote.textContent = "本机服务未连接"; toast(error.message, true); }
     render();
-    setInterval(refreshRuntime, 1000);
+    setInterval(refreshRuntime, 350);
   }
 
   async function refreshRuntime() {
     if (!state.connected) return;
+    const requestID = ++state.runtimeRequest;
     try {
-      state.runtime = await api("/api/state");
+      const runtime = await api("/api/state");
+      if (requestID !== state.runtimeRequest) return;
+      state.runtime = runtime;
       if (state.runtime.activeLectureID) {
-        state.currentLectureID = state.runtime.activeLectureID;
-        state.detail = await api(`/api/lectures/${state.runtime.activeLectureID}`);
+        if (state.runtime.recording && state.currentLectureID !== state.runtime.activeLectureID) selectLecture(state.runtime.activeLectureID);
+        if (state.currentLectureID === state.runtime.activeLectureID) await loadSelectedDetail();
       }
-      if (state.route === "live") renderLive();
+      if (state.route === "live") updateLiveRuntime();
     } catch {}
   }
 
   function render() {
     syncNav();
-    ({ live: renderLive, history: renderHistory, summary: renderSummary, qa: renderQA, settings: renderSettings, detail: renderDetail }[state.route] || renderLive)();
+    const route = state.route; const generation = ++state.routeRenderGeneration;
+    const renderer = { live: renderLive, history: renderHistory, summary: renderSummary, qa: renderQA, settings: renderSettings, detail: renderDetail }[route] || renderLive;
+    Promise.resolve(renderer(generation, route)).catch(error => {
+      if (renderIsCurrent(generation, route)) toast(error.message, true);
+    });
+  }
+  function renderIsCurrent(generation, route) { return generation === state.routeRenderGeneration && route === state.route; }
+
+  function updateLiveRuntime() {
+    const page = main.querySelector(".live-page");
+    if (!page) { renderLive(); return; }
+    const clock = page.querySelector(".lecture-clock strong");
+    const recording = page.querySelector(".lecture-clock span");
+    const level = page.querySelector(".level-track");
+    const levelNote = page.querySelector(".level-block small");
+    if (clock) clock.textContent = fmt(state.runtime.duration);
+    if (recording) recording.textContent = state.runtime.recording ? "REC · 正在录音" : "READY · 等待开始";
+    if (level) level.value = Math.round((state.runtime.audioLevel || 0) * 100);
+    if (levelNote) levelNote.textContent = state.runtime.recording && state.runtime.receivingAudio === false ? "未收到声音，请检查输入设备" : state.runtime.recording && (state.runtime.audioLevel || 0) < .08 ? "声音偏小，请靠近教授" : "保持 Mac 靠近声源";
+    updateLiveStream("english", state.runtime.volatileEnglish);
+    updateLiveStream("chinese", state.runtime.volatileChinese);
+  }
+
+  function updateLiveStream(language, draft) {
+    const stream = main.querySelector(`.transcript-stream[data-stream="${language}"]`);
+    if (!stream) return;
+    const segments = state.detail?.lecture?.id === state.currentLectureID
+      ? transcriptWindow((state.detail.transcripts || []).filter(s => s.source === (language === "english" ? "liveEnglish" : "liveChinese"))) : [];
+    const signature = `${segments.map(s => s.id).join("|")}::${draft || ""}`;
+    if (stream.dataset.signature === signature) return;
+    const previous = captureStreamPositions().find(item => item.name === language);
+    updateStreamElements(stream, segments, draft, language);
+    stream.dataset.signature = signature;
+    if (previous) restoreStreamPositions([previous]); else stream.scrollTop = stream.scrollHeight;
+  }
+
+  function updateStreamElements(stream, segments, draft, language) {
+    stream.querySelector(".list-empty")?.remove();
+    const draftNode = stream.querySelector(`[data-draft="${language}"]`);
+    const existing = new Set([...stream.querySelectorAll("[data-segment]")].map(node => node.dataset.segment));
+    segments.forEach(segment => {
+      if (existing.has(segment.id)) return;
+      const holder = document.createElement("template");
+      holder.innerHTML = liveSegmentMarkup(segment, language);
+      stream.insertBefore(holder.content.firstElementChild, draftNode || null);
+    });
+    const allowed = new Set(segments.map(segment => segment.id));
+    stream.querySelectorAll("[data-segment]").forEach(node => { if (!allowed.has(node.dataset.segment)) node.remove(); });
+    if (draft) {
+      const node = stream.querySelector(`[data-draft="${language}"]`);
+      if (node) node.querySelector("p").textContent = draft;
+      else { const holder = document.createElement("template"); holder.innerHTML = draftMarkup(draft, language); stream.append(holder.content.firstElementChild); }
+    } else {
+      stream.querySelector(`[data-draft="${language}"]`)?.remove();
+    }
+    if (!segments.length && !draft) stream.innerHTML = emptyStreamMarkup(language);
   }
 
   function empty(title, copy, action = "新建课程") { const actionID = action === "查看课程历史" ? "view-history" : "new-course"; return `<section class="empty-state"><div><span class="eyebrow">LOCAL ARCHIVE</span><h2>${escapeHTML(title)}</h2><p>${escapeHTML(copy)}</p>${button(action, actionID, "button-primary")}</div></section>`; }
@@ -109,6 +214,7 @@
         name: stream.dataset.stream,
         scrollTop: stream.scrollTop,
         scrollHeight: stream.scrollHeight,
+        wasNearBottom: stream.scrollHeight - stream.scrollTop - stream.clientHeight < 72,
         anchorID: anchor?.dataset.segment || null,
         anchorOffset: anchor ? anchor.offsetTop - stream.scrollTop : 0
       };
@@ -118,7 +224,8 @@
   function restoreStreamPositions(positions) {
     positions.forEach(previous => {
       const stream = main.querySelector(`.transcript-stream[data-stream="${previous.name}"]`);
-      if (!stream || previous.scrollTop <= 1) return;
+      if (!stream) return;
+      if (previous.wasNearBottom) { stream.scrollTop = stream.scrollHeight; return; }
       const anchor = previous.anchorID
         ? [...stream.querySelectorAll("[data-segment]")].find(node => node.dataset.segment === previous.anchorID)
         : null;
@@ -130,25 +237,45 @@
     });
   }
 
+  function transcriptWindow(values) {
+    return values.slice(-240).sort((a, b) => Number(a.startTime) - Number(b.startTime));
+  }
+
+  function liveSegmentMarkup(s, language) {
+    return language === "english"
+      ? `<button class="segment ${s.confidence != null && s.confidence < .55 ? "is-low" : ""}" data-segment="${escapeHTML(s.id)}" data-time="${s.startTime}"><time>${fmt(s.startTime)}</time><p>${escapeHTML(s.text)}</p>${s.confidence != null ? `<small>${Math.round(s.confidence * 100)}%</small>` : ""}</button>`
+      : `<div class="segment" data-segment="${escapeHTML(s.id)}"><time>${fmt(s.startTime)}</time><p>${escapeHTML(s.text)}</p></div>`;
+  }
+  function emptyStreamMarkup(language) { return `<div class="list-empty">${language === "english" ? (state.runtime.recording ? "正在聆听教授…" : "开始课堂后，确认的英文会出现在这里。") : "中文会跟随确认后的英文逐段出现。"}</div>`; }
+  function draftMarkup(draft, language) { return draft ? `<div class="segment draft" data-draft="${language}"><time>LIVE</time><p>${escapeHTML(draft)}</p></div>` : ""; }
+
+  function liveStreamMarkup(segments, draft, language) {
+    const content = segments.length ? segments.map(s => liveSegmentMarkup(s, language)).join("") : emptyStreamMarkup(language);
+    return content + draftMarkup(draft, language);
+  }
+
   function renderLive() {
     breadcrumb.textContent = "课堂 / 实时课堂"; const selected = course();
     if (!state.courses.length) { main.innerHTML = empty("先建立第一门课程", "课程词汇表会直接帮助本地英文识别器更准确地听懂教授、术语和缩写。"); return; }
     const preservedStreams = captureStreamPositions();
-    const segments = state.detail?.transcripts || [];
-    const newestFirst = values => values.slice(-120).reverse();
-    const english = newestFirst(segments.filter(s => s.source === "liveEnglish"));
-    const chinese = newestFirst(segments.filter(s => s.source === "liveChinese"));
+    const segments = state.detail?.lecture?.id === state.currentLectureID ? state.detail.transcripts || [] : [];
+    const english = transcriptWindow(segments.filter(s => s.source === "liveEnglish"));
+    const chinese = transcriptWindow(segments.filter(s => s.source === "liveChinese"));
     const transitionLabel = state.runtime.transitionKind === "starting" ? "正在准备…" : state.runtime.transitionKind === "stopping" ? "正在保存…" : null;
     main.innerHTML = `<section class="page live-page">
       <header class="page-head live-head"><div><span class="eyebrow">LIVE LECTURE</span><h1>听课，不漏掉上下文。</h1><p>英文识别和中文翻译在本机运行；原始录音始终保留。</p></div><div class="lecture-clock"><strong>${fmt(state.runtime.duration)}</strong><span>${state.runtime.recording ? "REC · 正在录音" : "READY · 等待开始"}</span></div></header>
-      <div class="control-rail"><label class="select-field"><span>当前课程</span><select id="course-select">${state.courses.map(c => `<option value="${c.id}" ${c.id === selected?.id ? "selected" : ""}>${escapeHTML(c.name)}${c.code ? ` · ${escapeHTML(c.code)}` : ""}</option>`).join("")}</select><small>${escapeHTML(localeLabel(selected?.speechLocaleIdentifier))} · ${(selected?.vocabulary || []).length} 个专业词</small></label><div class="level-block"><span>麦克风</span><progress class="level-track" max="100" value="${Math.round((state.runtime.audioLevel || 0) * 100)}" aria-label="麦克风音量"></progress><small>${state.runtime.recording && state.runtime.receivingAudio === false ? "未收到声音，请检查输入设备" : state.runtime.recording && (state.runtime.audioLevel || 0) < .08 ? "声音偏小，请靠近教授" : "保持 Mac 靠近声源"}</small></div><div class="control-actions">${button("标记重点", "marker", "button-quiet", !state.runtime.recording || state.runtime.transitioning)}${button(transitionLabel || (state.runtime.recording ? "结束课堂" : "开始课堂"), state.runtime.recording ? "stop" : "start", state.runtime.recording ? "button-danger" : "button-primary", state.runtime.transitioning)}</div></div>
-      <div class="transcript-workspace"><article class="transcript-column"><header><span class="mono-label">ENGLISH · WHISPER</span><span>最新内容在上方 · 可回看约 12 分钟</span></header><div class="transcript-stream" data-stream="english">${state.runtime.volatileEnglish ? `<div class="segment draft"><time>LIVE</time><p>${escapeHTML(state.runtime.volatileEnglish)}</p></div>` : ""}${english.length ? english.map(s => `<button class="segment ${s.confidence != null && s.confidence < .55 ? "is-low" : ""}" data-segment="${escapeHTML(s.id)}" data-time="${s.startTime}"><time>${fmt(s.startTime)}</time><p>${escapeHTML(s.text)}</p>${s.confidence != null ? `<small>${Math.round(s.confidence * 100)}%</small>` : ""}</button>`).join("") : `<div class="list-empty">${state.runtime.recording ? "正在聆听教授…" : "开始课堂后，确认的英文会出现在这里。"}</div>`}</div></article>
-      <article class="transcript-column chinese"><header><span class="mono-label">简体中文 · APPLE</span><span>最新内容在上方</span></header><div class="transcript-stream" data-stream="chinese">${state.runtime.volatileChinese && state.runtime.volatileChinese !== chinese[0]?.text ? `<div class="segment draft"><time>LIVE</time><p>${escapeHTML(state.runtime.volatileChinese)}</p></div>` : ""}${chinese.length ? chinese.map(s => `<div class="segment" data-segment="${escapeHTML(s.id)}"><time>${fmt(s.startTime)}</time><p>${escapeHTML(s.text)}</p></div>`).join("") : `<div class="list-empty">中文会跟随确认后的英文逐段出现。</div>`}</div></article></div>
+      <div class="control-rail"><label class="select-field"><span>当前课程</span><select id="course-select" ${state.runtime.recording ? "disabled" : ""}>${state.courses.map(c => `<option value="${c.id}" ${c.id === selected?.id ? "selected" : ""}>${escapeHTML(c.name)}${c.code ? ` · ${escapeHTML(c.code)}` : ""}</option>`).join("")}</select><small>${escapeHTML(localeLabel(selected?.speechLocaleIdentifier))} · ${(selected?.vocabulary || []).length} 个专业词</small></label><div class="level-block"><span>麦克风</span><progress class="level-track" max="100" value="${Math.round((state.runtime.audioLevel || 0) * 100)}" aria-label="麦克风音量"></progress><small>${state.runtime.recording && state.runtime.receivingAudio === false ? "未收到声音，请检查输入设备" : state.runtime.recording && (state.runtime.audioLevel || 0) < .08 ? "声音偏小，请靠近教授" : "保持 Mac 靠近声源"}</small></div><div class="control-actions">${button("标记重点", "marker", "button-quiet", !state.runtime.recording || state.runtime.transitioning)}${button(transitionLabel || (state.runtime.recording ? "结束课堂" : "开始课堂"), state.runtime.recording ? "stop" : "start", state.runtime.recording ? "button-danger" : "button-primary", state.runtime.transitioning)}</div></div>
+      <div class="transcript-workspace"><article class="transcript-column"><header><span class="mono-label">ENGLISH · LOCAL SPEECH</span><span>时间正序 · 草稿在底部自动更新</span></header><div class="transcript-stream" data-stream="english">${liveStreamMarkup(english, state.runtime.volatileEnglish, "english")}</div></article>
+      <article class="transcript-column chinese"><header><span class="mono-label">简体中文 · APPLE</span><span>时间正序</span></header><div class="transcript-stream" data-stream="chinese">${liveStreamMarkup(chinese, state.runtime.volatileChinese, "chinese")}</div></article></div>
       <footer class="live-status"><span>${escapeHTML(state.runtime.statusMessage || "录音、识别、翻译互相独立；翻译失败不会停止录音。")}${!state.runtime.translationAvailable ? ` ${button("下载翻译语言", "translation-settings", "button-quiet")}` : ""}</span><span>源文件 · ~/Library/Application Support/Lecture</span></footer></section>`;
     restoreStreamPositions(preservedStreams);
+    if (!preservedStreams.length) main.querySelectorAll(".transcript-stream").forEach(stream => { stream.scrollTop = stream.scrollHeight; });
+    main.querySelector('[data-stream="english"]')?.setAttribute("data-signature", `${english.map(s => s.id).join("|")}::${state.runtime.volatileEnglish || ""}`);
+    main.querySelector('[data-stream="chinese"]')?.setAttribute("data-signature", `${chinese.map(s => s.id).join("|")}::${state.runtime.volatileChinese || ""}`);
     document.getElementById("course-select")?.addEventListener("change", e => {
       if (state.runtime.recording) { e.target.value = state.currentCourseID; toast("录音过程中不能切换课程", true); return; }
-      state.currentCourseID = e.target.value; state.currentLectureID = null; state.detail = null;
+      selectCourse(e.target.value, { chooseLatestLecture: false });
+      renderLive();
     });
   }
 
@@ -164,15 +291,19 @@
     document.getElementById("course-search")?.addEventListener("input", e => document.querySelectorAll(".course-row").forEach(row => row.hidden = !row.textContent.toLowerCase().includes(e.target.value.toLowerCase())));
   }
 
-  async function renderDetail() {
+  async function renderDetail(generation = state.routeRenderGeneration, route = state.route) {
     breadcrumb.textContent = "资料库 / 课堂详情";
     if (!state.currentLectureID) { setRoute("history"); return; }
-    try { state.detail = await api(`/api/lectures/${state.currentLectureID}`); } catch (e) { toast(e.message, true); return; }
-    const { lecture, transcripts, markers, summaries, liveQuality, reviewedQuality } = state.detail; const reviewed = transcripts.filter(s => s.source === "reviewedEnglish"); const live = transcripts.filter(s => s.source === "liveEnglish"); const english = preferredEnglish(live, reviewed); const corrected = transcripts.filter(s => s.source === "correctedChinese"); const correctedMatchesEnglish = corrected.length && corrected.every(s => english.some(e => e.id === s.sourceSegmentID)); const zh = correctedMatchesEnglish ? corrected : transcripts.filter(s => s.source === "liveChinese");
+    if (state.detail?.lecture?.id !== state.currentLectureID) {
+      main.innerHTML = `<section class="page loading-page">${selectorHTML()}<p class="list-empty">正在更新这次课堂记录…</p></section>`;
+    }
+    try { if (!await loadSelectedDetail()) return; } catch (e) { toast(e.message, true); return; }
+    if (!renderIsCurrent(generation, route) || route !== "detail") return;
+    const { lecture, transcripts, markers, summaries, liveQuality, reviewedQuality } = state.detail; const reviewed = transcripts.filter(s => s.source === "reviewedEnglish"); const live = transcripts.filter(s => s.source === "liveEnglish"); const english = preferredEnglish(live, reviewed); const usingReviewed = english.length > 0 && english.every(s => s.source === "reviewedEnglish"); const corrected = transcripts.filter(s => s.source === "correctedChinese"); const englishIDs = new Set(english.map(s => s.id)); const correctedIDs = new Set(corrected.map(s => s.sourceSegmentID).filter(Boolean)); const correctedMatchesEnglish = corrected.length && corrected.every(s => englishIDs.has(s.sourceSegmentID)) && [...englishIDs].every(id => correctedIDs.has(id)); const zh = correctedMatchesEnglish ? corrected : transcripts.filter(s => s.source === "liveChinese");
     main.innerHTML = `<section class="page"><button class="back-link" data-action="back-history">${icon("back")}课程历史</button><header class="page-head"><div><span class="eyebrow">LECTURE RECORD</span><h1>${escapeHTML(lecture.title)}</h1><p>${date(lecture.startedAt)} · ${fmt(lecture.duration)} · ${escapeHTML(statusLabel(lecture.status))}</p></div>${["failed","interrupted","completed"].includes(lecture.status) && (!summaries.length || lecture.status !== "completed") ? button(summaries.length ? "重新处理" : "生成复核与总结", "retry", "button-primary") : ""}</header>
       <div class="audio-console"><audio id="audio" controls preload="metadata" src="/api/lectures/${lecture.id}/audio?token=${encodeURIComponent(token)}"></audio><span>原始录音 · 仅在本机</span></div>
       <section class="quality-panel"><div><span class="eyebrow">RECOGNITION QUALITY</span><h2>识别质量证据</h2><p>Whisper 在本机运行；原音、时间轴和实时/复核双版本用于抽查。严格准确率请用已知稿计算 WER。</p></div><div class="quality-cards">${qualityCard("实时确认稿", liveQuality)}${qualityCard("课后复核稿", reviewedQuality)}</div></section>
-      <div class="detail-grid"><article class="paper transcript-paper"><header><span class="mono-label">${reviewed.length ? "REVIEWED ENGLISH" : "LIVE ENGLISH"}</span><span>${english.filter(s => s.confidence != null && s.confidence < .55).length} 处待复核</span></header>${english.map(s => `<button class="detail-segment" data-time="${s.startTime}"><time>${fmt(s.startTime)}</time><p>${escapeHTML(s.text)}</p></button>`).join("") || `<p class="list-empty">尚无英文逐字稿。</p>`}</article><article class="paper transcript-paper chinese"><header><span class="mono-label">${corrected.length ? "DEEPSEEK CORRECTED" : "LIVE CHINESE"}</span></header>${zh.map(s => `<div class="detail-segment"><time>${fmt(s.startTime)}</time><p>${escapeHTML(s.text)}</p></div>`).join("") || `<p class="list-empty">尚无中文翻译。</p>`}</article></div>
+      <div class="detail-grid"><article class="paper transcript-paper"><header><span class="mono-label">${usingReviewed ? "REVIEWED ENGLISH" : "LIVE ENGLISH · SAFEST VERSION"}</span><span>${english.filter(s => s.confidence != null && s.confidence < .55).length} 处待复核</span></header>${english.map(s => `<button class="detail-segment" data-time="${s.startTime}"><time>${fmt(s.startTime)}</time><p>${escapeHTML(s.text)}</p></button>`).join("") || `<p class="list-empty">尚无英文逐字稿。</p>`}</article><article class="paper transcript-paper chinese"><header><span class="mono-label">${correctedMatchesEnglish ? "AI CORRECTED CHINESE" : "LIVE CHINESE · COMPLETE FALLBACK"}</span></header>${zh.map(s => `<div class="detail-segment"><time>${fmt(s.startTime)}</time><p>${escapeHTML(s.text)}</p></div>`).join("") || `<p class="list-empty">尚无中文翻译。</p>`}</article></div>
       <section class="marker-strip"><span class="mono-label">MARKERS</span>${markers.map(m => `<button data-time="${m.time}">${fmt(m.time)} · ${escapeHTML(m.label)}</button>`).join("") || "没有课堂标记"}</section><section class="export-list"><a class="export-action" href="/api/lectures/${lecture.id}/export?token=${encodeURIComponent(token)}" download>${icon("download")}<span>导出 Markdown 学习档案</span><span>仅文字 · 不含 API Key</span></a></section>${summaries[0] ? `<section class="summary-preview"><span class="eyebrow">LATEST SUMMARY</span><h2>最新学习总结</h2><p>${escapeHTML(summaries[0].content.overview)}</p>${button("打开完整总结", "open-summary", "button-primary")}</section>` : ""}</section>`;
     applyPendingAudioJump();
   }
@@ -187,36 +318,49 @@
     else audio.addEventListener("loadedmetadata", seek, { once: true });
   }
 
-  async function renderSummary() {
+  async function renderSummary(generation = state.routeRenderGeneration, route = state.route) {
     breadcrumb.textContent = "复习 / 学习总结";
-    if (!state.detail?.summaries?.length) {
-      const candidates = [state.currentLectureID, ...state.lectures.map(l => l.id)].filter((id, index, values) => id && values.indexOf(id) === index);
-      for (const id of candidates) {
-        try {
-          const detail = await api(`/api/lectures/${id}`);
-          if (detail.summaries?.length) { state.currentLectureID = id; state.currentCourseID = detail.lecture.courseID; state.detail = detail; break; }
-        } catch {}
-      }
+    if (state.currentLectureID && state.detail?.lecture?.id !== state.currentLectureID) {
+      main.innerHTML = `<section class="page loading-page">${selectorHTML()}<p class="list-empty">正在载入所选课堂的总结…</p></section>`;
+      try { if (!await loadSelectedDetail()) return; } catch (e) { toast(e.message, true); }
     }
+    if (!renderIsCurrent(generation, route) || route !== "summary") return;
     const summary = state.detail?.summaries?.[0]?.content;
-    if (!summary) { main.innerHTML = empty("还没有可读的总结", "结束一节课堂后，Lecture 会先本地复核英文，再用 DeepSeek 生成忠于原文的学习资料。", "查看课程历史"); return; }
+    if (!summary) { main.innerHTML = `<section class="page">${selectorHTML()}${empty("这次课堂还没有可读的总结", "结束课堂后，Lecture 会使用这次录音的完整英文稿生成学习资料。", "查看课程历史")}</section>`; return; }
     const list = (title, values) => `<section><h3>${title}</h3><ul>${(values || []).map(v => `<li>${escapeHTML(v)}</li>`).join("") || "<li>暂无</li>"}</ul></section>`;
-    main.innerHTML = `<article class="page summary-document"><header><span class="eyebrow">STUDY EDITION</span><h1>课堂学习总结</h1><p>${escapeHTML(summary.overview)}</p></header><div class="summary-columns">${list("核心概念", summary.coreConcepts)}${list("定义", summary.definitions)}${list("教授举例", summary.professorExamples)}${list("教授强调", summary.professorEmphasis)}${list("可能的考试方向 *", summary.possibleExamTopics)}${list("仍待解决的问题", summary.unresolvedQuestions)}</div><section class="glossary"><h2>双语术语表</h2>${(summary.glossary || []).map(g => `<div><strong>${escapeHTML(g.english)}</strong><span>${escapeHTML(g.chinese)}</span><p>${escapeHTML(g.explanation)}</p></div>`).join("")}</section><small>* 仅为根据课堂内容推测的复习方向，不代表教授承诺的考试范围。</small></article>`;
+    main.innerHTML = `<article class="page summary-document">${selectorHTML()}<header><span class="eyebrow">STUDY EDITION</span><h1>${escapeHTML(state.detail.lecture.title)} · 学习总结</h1><p>${escapeHTML(summary.overview)}</p></header><div class="summary-columns">${list("核心概念", summary.coreConcepts)}${list("定义", summary.definitions)}${list("教授举例", summary.professorExamples)}${list("教授强调", summary.professorEmphasis)}${list("可能的考试方向 *", summary.possibleExamTopics)}${list("仍待解决的问题", summary.unresolvedQuestions)}</div><section class="glossary"><h2>双语术语表</h2>${(summary.glossary || []).map(g => `<div><strong>${escapeHTML(g.english)}</strong><span>${escapeHTML(g.chinese)}</span><p>${escapeHTML(g.explanation)}</p></div>`).join("")}</section><small>* 仅为根据课堂内容推测的复习方向，不代表教授承诺的考试范围。</small></article>`;
   }
 
-  async function renderQA() {
-    breadcrumb.textContent = "复习 / DeepSeek 问答"; const c = course();
+  async function renderQA(generation = state.routeRenderGeneration, route = state.route) {
+    breadcrumb.textContent = "复习 / AI 问答"; const c = course();
     if (!c) { main.innerHTML = empty("先选择一门课程", "问答只会引用你自己的课堂逐字稿。"); return; }
     const lectureScope = state.qaScope === "lecture" && state.currentLectureID;
-    try { state.chat = await api(`/api/courses/${c.id}/chat${lectureScope ? `?lectureID=${state.currentLectureID}` : ""}`); } catch {}
+    const courseID = c.id; const lectureID = lectureScope ? state.currentLectureID : null;
+    main.innerHTML = `<section class="page qa-page loading-page">${selectorHTML()}<p class="list-empty">正在载入${lectureScope ? "这次课堂" : "整门课程"}的问答记录…</p></section>`;
+    let chat = []; try { chat = await api(`/api/courses/${courseID}/chat${lectureID ? `?lectureID=${lectureID}` : ""}`); } catch {}
+    if (!renderIsCurrent(generation, route) || route !== "qa" || course()?.id !== courseID || (lectureScope ? state.currentLectureID !== lectureID : state.qaScope !== "course")) return;
+    state.chat = chat;
     const selectedLecture = state.lectures.find(l => l.id === state.currentLectureID);
-    main.innerHTML = `<section class="page qa-page"><header class="page-head"><div><span class="eyebrow">GROUNDED Q&A</span><h1>只依据教授说过的话回答。</h1><p>每条回答都应带课堂和时间引用；证据不足时会明确说明。</p></div></header><div class="scope-switch"><button class="${lectureScope ? "" : "is-active"}" data-action="qa-scope:course">整门课程</button><button class="${lectureScope ? "is-active" : ""}" data-action="qa-scope:lecture" ${state.currentLectureID ? "" : "disabled"}>当前课堂</button><span>${escapeHTML(lectureScope ? selectedLecture?.title || c.name : c.name)}</span></div><div class="chat-stream">${state.chat.map(m => `<article class="chat ${m.role}"><span>${m.role === "user" ? "YOU" : "DEEPSEEK"}</span><p>${escapeHTML(m.text)}</p>${(m.citations || []).map(x => `<button data-time="${x.startTime}" data-lecture="${x.lectureID}">${escapeHTML(x.lectureTitle)} · ${fmt(x.startTime)}</button>`).join("")}</article>`).join("") || `<div class="list-empty">例如：教授如何解释这个概念？这节课最重要的三点是什么？</div>`}</div><form id="qa-form" class="question-box"><textarea name="question" required placeholder="向课堂记录提问…"></textarea><button class="button button-primary">${icon("send")}发送</button></form></section>`;
+    main.innerHTML = `<section class="page qa-page">${selectorHTML()}<header class="page-head"><div><span class="eyebrow">GROUNDED Q&A</span><h1>只依据教授说过的话回答。</h1><p>每条回答都应带课堂和时间引用；证据不足时会明确说明。</p></div></header><div class="scope-switch"><button class="${lectureScope ? "" : "is-active"}" data-action="qa-scope:course">整门课程</button><button class="${lectureScope ? "is-active" : ""}" data-action="qa-scope:lecture" ${state.currentLectureID ? "" : "disabled"}>这次课堂</button><span>${escapeHTML(lectureScope ? selectedLecture?.title || c.name : c.name)}</span></div><div class="chat-stream">${state.chat.map(m => `<article class="chat ${m.role}"><span>${m.role === "user" ? "YOU" : "AI"}</span><p>${escapeHTML(m.text)}</p>${(m.citations || []).map(x => `<button data-time="${x.startTime}" data-lecture="${x.lectureID}">${escapeHTML(x.lectureTitle)} · ${fmt(x.startTime)}</button>`).join("")}</article>`).join("") || `<div class="list-empty">例如：教授如何解释这个概念？这节课最重要的三点是什么？</div>`}</div><form id="qa-form" class="question-box"><textarea name="question" required placeholder="向课堂记录提问…"></textarea><button class="button button-primary">${icon("send")}发送</button></form></section>`;
     document.getElementById("qa-form")?.addEventListener("submit", askQuestion);
   }
 
   function renderSettings() {
-    breadcrumb.textContent = "Lecture / 设置与诊断"; const r = state.runtime;
-    main.innerHTML = `<section class="page settings-page"><header class="page-head"><div><span class="eyebrow">LOCAL DIAGNOSTICS</span><h1>课前，确认一切就绪。</h1><p>Lecture 不提供云端录音，也不会把音频发送给 DeepSeek。</p></div></header><div class="diagnostic-list"><div><span>${icon("mic")}麦克风与本地 Whisper</span><strong>${r.speechAvailable ? "可用" : "需要重新安装"}</strong></div><div><span>${icon("external")}英文 → 简体中文</span><strong>${r.translationAvailable ? "可用" : "需要下载离线语言"}</strong>${r.translationAvailable ? "" : button("打开下载页", "translation-settings", "button-quiet")}</div><div><span>${icon("lock")}DeepSeek API</span><strong>${r.deepSeekConfigured ? "已存入钥匙串" : "尚未配置"}</strong></div><div><span>${icon("database")}本地资料库</span><strong>${bytes(state.storage.totalBytes)} · ${state.storage.recordingCount || 0} 份录音</strong></div></div><section class="accuracy-guide"><div><span class="eyebrow">ACCURACY PROTOCOL</span><h2>四层识别保障</h2></div><ol><li><strong>本地模型</strong><span>Whisper Base English 全程在这台 Mac 上识别。</span></li><li><strong>课程词汇</strong><span>专业词、人名和缩写会作为识别提示词。</span></li><li><strong>完整复核</strong><span>停止录音后用完整原音再识别一次，替代课堂分段稿。</span></li><li><strong>证据可追溯</strong><span>保留原音、时间轴及实时/复核双版本。</span></li></ol><p>软件不能承诺 100% 正确。要测真实准确率，请用一段已知英文稿计算词错误率（WER）。</p></section><section class="settings-section"><div><span class="eyebrow">LOCAL STORAGE</span><h2>本地资料与导出</h2><p>数据目录：~/Library/Application Support/Lecture。每节课堂可从详情页导出 Markdown，录音不会嵌入导出文件。</p></div><strong>${bytes(state.storage.recordingBytes)} 录音 · ${bytes(state.storage.databaseBytes)} 历史库 · ${bytes(state.storage.exportBytes)} 导出</strong></section><section class="settings-section"><div><span class="eyebrow">MACOS KEYCHAIN</span><h2>DeepSeek 密钥</h2><p>网页只负责提交；密钥由原生助手直接写入 macOS 钥匙串，浏览器不会保存。</p></div><div>${button(r.deepSeekConfigured ? "更换密钥" : "保存密钥", "key", "button-primary")} ${r.deepSeekConfigured ? button("测试连接", "test-key") + button("删除", "delete-key", "button-danger") : ""}</div></section></section>`;
+    breadcrumb.textContent = "Lecture / 设置与诊断"; const r = state.runtime; const config = state.ai.configuration || {};
+    const providerOptions = (state.ai.presets || []).map((preset, index) => `<option value="${index}">${escapeHTML(preset.name)} · ${escapeHTML(preset.model)}</option>`).join("");
+    main.innerHTML = `<section class="page settings-page"><header class="page-head"><div><span class="eyebrow">LOCAL DIAGNOSTICS</span><h1>课前，确认一切就绪。</h1><p>Lecture 的录音和英文识别留在本机；AI 服务只接收课堂文字。</p></div></header><div class="diagnostic-list"><div><span>${icon("mic")}麦克风与本地识别</span><strong>${r.speechAvailable ? "可用" : "需要重新安装"}</strong></div><div><span>${icon("external")}英文 → 简体中文</span><strong>${r.translationAvailable ? "可用" : "需要下载离线语言"}</strong>${r.translationAvailable ? "" : button("打开下载页", "translation-settings", "button-quiet")}</div><div><span>${icon("lock")}AI 服务</span><strong>${state.ai.keyConfigured ? `${escapeHTML(config.name || "已配置")} · ${escapeHTML(config.model || "")}` : "还需要 API Key"}</strong></div><div><span>${icon("database")}本地资料库</span><strong>${bytes(state.storage.totalBytes)} · ${state.storage.recordingCount || 0} 份录音</strong></div></div><section class="accuracy-guide"><div><span class="eyebrow">ACCURACY PROTOCOL</span><h2>收音与识别建议</h2></div><ol><li><strong>先改善距离</strong><span>麦克风越靠近教授，收益越大；远距离混响无法完全靠算法修复。</span></li><li><strong>实时草稿与断句</strong><span>本地模型约每 2–3 秒更新草稿；检测到约 0.75 秒停顿时提前确认一句。</span></li><li><strong>Silero VAD</strong><span>课后使用本地语音活动检测过滤静音和常见幻觉；复核稿过少时自动保留实时稿。</span></li><li><strong>外接设备</strong><span>前排指向性麦克风或教授佩戴的无线领夹麦效果最好；麦克风距离比价格更重要。</span></li></ol><p>DeepSeek 或其他聊天模型没有在听音频；它们只处理本地识别后的英文文本，所以不需要音频多模态能力。</p></section><section class="settings-section ai-provider-section"><div><span class="eyebrow">OPENAI-COMPATIBLE AI</span><h2>任意 AI 服务与模型</h2><p>可以使用 DeepSeek、OpenAI、OpenRouter 或本地 OpenAI 兼容服务。远程地址必须是 HTTPS；本地服务可用 127.0.0.1。</p></div><form id="ai-config-form" class="ai-config-form"><label class="field field-wide"><span>快速预设</span><select id="ai-preset"><option value="">自定义</option>${providerOptions}</select></label><label class="field"><span>显示名称</span><input name="name" required value="${escapeHTML(config.name || "")}"></label><label class="field"><span>服务类型</span><select name="providerKind"><option value="deepSeek" ${config.providerKind === "deepSeek" ? "selected" : ""}>DeepSeek</option><option value="openAICompatible" ${config.providerKind === "openAICompatible" ? "selected" : ""}>OpenAI 兼容</option><option value="local" ${config.providerKind === "local" ? "selected" : ""}>本地服务</option></select></label><label class="field field-wide"><span>Base URL</span><input name="baseURL" required spellcheck="false" value="${escapeHTML(config.baseURL || "")}"></label><label class="field field-wide"><span>模型名称</span><input name="model" required spellcheck="false" value="${escapeHTML(config.model || "")}"></label><label class="check-field"><input type="checkbox" name="requiresAPIKey" ${config.requiresAPIKey !== false ? "checked" : ""}><span>需要 API Key</span></label><label class="check-field"><input type="checkbox" name="sendThinkingDisabled" ${config.sendThinkingDisabled ? "checked" : ""}><span>发送 DeepSeek thinking disabled</span></label><label class="check-field"><input type="checkbox" name="supportsJSONResponseFormat" ${config.supportsJSONResponseFormat !== false ? "checked" : ""}><span>支持 JSON response_format</span></label><div class="ai-actions"><button class="button button-primary" type="submit">保存模型设置</button>${button(state.ai.keyConfigured ? "更换 API Key" : "保存 API Key", "key", "button-quiet")} ${button("测试连接", "test-key", "button-quiet")} ${state.ai.keyConfigured && config.requiresAPIKey !== false ? button("删除 Key", "delete-key", "button-danger") : ""}</div><p class="form-note">模型设置与“已配置”状态保存在本地网页/本机配置中；密钥输入一次后由 Lecture 安全保存，网页不会再次索要或显示明文。</p></form></section><section class="settings-section"><div><span class="eyebrow">LOCAL STORAGE</span><h2>本地资料与导出</h2><p>数据目录：~/Library/Application Support/Lecture。API Key 由本机钥匙串保存，因此不用每次输入密码，网页也无法取回明文。</p></div><strong>${bytes(state.storage.recordingBytes)} 录音 · ${bytes(state.storage.databaseBytes)} 历史库</strong></section></section>`;
+    const form = document.getElementById("ai-config-form");
+    form?.addEventListener("submit", saveAIConfiguration);
+    document.getElementById("ai-preset")?.addEventListener("change", event => {
+      const preset = state.ai.presets?.[Number(event.target.value)]; if (!preset) return;
+      Object.entries(preset).forEach(([key, value]) => { const field = form.elements[key]; if (!field) return; if (field.type === "checkbox") field.checked = Boolean(value); else field.value = value; });
+    });
+  }
+
+  async function saveAIConfiguration(event) {
+    event.preventDefault(); const form = event.currentTarget; const values = new FormData(form);
+    const body = { name: values.get("name"), baseURL: values.get("baseURL"), model: values.get("model"), providerKind: values.get("providerKind"), requiresAPIKey: form.elements.requiresAPIKey.checked, sendThinkingDisabled: form.elements.sendThinkingDisabled.checked, supportsJSONResponseFormat: form.elements.supportsJSONResponseFormat.checked };
+    try { state.ai = await api("/api/ai/config", { method: "PUT", body: JSON.stringify(body) }); toast("AI 服务与模型设置已保存"); renderSettings(); } catch (e) { toast(e.message, true); }
   }
 
   async function action(value, source = null) {
@@ -229,21 +373,31 @@
     try {
       if (value === "new-course") openCourseDialog();
       else if (value.startsWith("edit-course:")) openCourseDialog(state.courses.find(c => c.id === value.split(":")[1]));
-      else if (value.startsWith("lecture:")) { state.currentLectureID = value.split(":")[1]; const lecture = state.lectures.find(l => l.id === state.currentLectureID); state.currentCourseID = lecture?.courseID || state.currentCourseID; setRoute("detail"); }
-      else if (value.startsWith("qa-course:")) { state.currentCourseID = value.split(":")[1]; state.qaScope = "course"; setRoute("qa"); }
-      else if (value.startsWith("qa-scope:")) { state.qaScope = value.split(":")[1]; await renderQA(); }
-      else if (value === "start") { const c = course(); if (!c) return; toast("首次使用时，请在系统窗口允许麦克风与语音识别"); const lecture = await api("/api/lectures/start", { method: "POST", body: JSON.stringify({ courseID: c.id }) }); state.currentLectureID = lecture.id; state.currentCourseID = c.id; state.detail = await api(`/api/lectures/${lecture.id}`); toast("课堂已开始；关闭网页也会继续录音"); await reload(); }
-      else if (value === "stop") { const lecture = await api("/api/lectures/stop", { method: "POST", body: "{}" }); state.currentLectureID = lecture.id; toast("录音已保存，课后处理已开始"); await reload(); }
+      else if (value.startsWith("lecture:")) { selectLecture(value.split(":")[1]); setRoute("detail"); }
+      else if (value.startsWith("qa-course:")) { selectCourse(value.split(":")[1]); state.qaScope = "course"; persistSelection(); setRoute("qa"); }
+      else if (value.startsWith("qa-scope:")) { state.qaScope = value.split(":")[1]; persistSelection(); render(); }
+      else if (value === "start") {
+        if (state.runtime.transitioning || state.runtime.recording) return;
+        state.runtime.transitioning = true; state.runtime.transitionKind = "starting"; renderLive();
+        const c = course(); if (!c) return; toast("首次使用时，请在系统窗口允许麦克风");
+        const lecture = await api("/api/lectures/start", { method: "POST", body: JSON.stringify({ courseID: c.id }) });
+        state.lectures = await api("/api/lectures"); selectLecture(lecture.id); state.detail = await api(`/api/lectures/${lecture.id}`); toast("课堂已开始；关闭网页也会继续录音"); await reload();
+      }
+      else if (value === "stop") {
+        if (state.runtime.transitioning || !state.runtime.recording) return;
+        state.runtime.transitioning = true; state.runtime.transitionKind = "stopping"; renderLive();
+        const lecture = await api("/api/lectures/stop", { method: "POST", body: "{}" }); selectLecture(lecture.id); toast("录音已保存，课后处理已开始"); await reload();
+      }
       else if (value === "marker") { await api("/api/markers", { method: "POST", body: JSON.stringify({ label: "课堂重点" }) }); toast("已标记当前时间"); }
       else if (value === "retry") { await api(`/api/lectures/${state.currentLectureID}/retry`, { method: "POST", body: "{}" }); toast("已重新开始课后处理"); }
       else if (value === "key") document.getElementById("key-dialog").showModal();
-      else if (value === "test-key") { await api("/api/deepseek/test", { method: "POST", body: "{}" }); toast("DeepSeek 连接正常"); }
+      else if (value === "test-key") { await api("/api/ai/test", { method: "POST", body: "{}" }); toast("AI 服务连接正常"); }
       else if (value === "translation-settings") { await api("/api/translation/settings", { method: "POST", body: "{}" }); toast("请下载英语（美国）和中文（普通话，简体）"); }
-      else if (value === "delete-key") { if (confirm("确定从 macOS 钥匙串删除 DeepSeek 密钥？")) { await api("/api/deepseek/key", { method: "DELETE" }); await reload(); } }
+      else if (value === "delete-key") { if (confirm("确定从 macOS 钥匙串删除当前 AI 服务的密钥？")) { await api("/api/ai/key", { method: "DELETE" }); await refreshAIConfiguration(); renderSettings(); } }
       else if (value === "back-history") setRoute("history");
       else if (value === "open-summary") setRoute("summary");
       else if (value === "view-history") setRoute("history");
-    } catch (error) { toast(error.message, true); }
+    } catch (error) { toast(error.message, true); if (value === "start" || value === "stop") await reload().catch(() => null); }
     finally { if (control?.isConnected) { control.disabled = false; control.textContent = originalLabel; } }
   }
 
@@ -257,15 +411,20 @@
     try { await api(existing ? `/api/courses/${id}` : "/api/courses", { method: existing ? "PUT" : "POST", body: JSON.stringify(body) }); document.getElementById("course-dialog").close(); await reload(); toast("课程已保存"); } catch (e) { toast(e.message, true); }
   }
 
-  async function askQuestion(event) { event.preventDefault(); const form = new FormData(event.currentTarget); const question = String(form.get("question") || "").trim(); if (!question) return; const lectureID = state.qaScope === "lecture" ? state.currentLectureID : null; try { await api("/api/qa", { method: "POST", body: JSON.stringify({ question, courseID: course().id, lectureID }) }); await renderQA(); } catch (e) { toast(e.message, true); } }
+  async function askQuestion(event) { event.preventDefault(); const form = new FormData(event.currentTarget); const question = String(form.get("question") || "").trim(); if (!question) return; const lectureID = state.qaScope === "lecture" ? state.currentLectureID : null; try { await api("/api/qa", { method: "POST", body: JSON.stringify({ question, courseID: course().id, lectureID }) }); render(); } catch (e) { toast(e.message, true); } }
   async function reload() {
     state.courses = await api("/api/courses");
     state.lectures = await api("/api/lectures");
     state.runtime = await api("/api/state");
-    await refreshStorage();
+    await Promise.all([refreshStorage(), refreshAIConfiguration()]);
     if (state.runtime.activeLectureID) {
-      state.currentLectureID = state.runtime.activeLectureID;
-      state.detail = await api(`/api/lectures/${state.runtime.activeLectureID}`);
+      selectLecture(state.runtime.activeLectureID);
+      await loadSelectedDetail();
+    } else {
+      if (!selectLecture(state.currentLectureID)) {
+        if (!selectCourse(state.currentCourseID)) selectCourse(state.courses[0]?.id || null);
+      }
+      if (state.currentLectureID) await loadSelectedDetail();
     }
     render();
   }
@@ -281,17 +440,22 @@
     const targetLectureID = timed.dataset.lecture;
     const requiresLectureChange = Boolean(targetLectureID && targetLectureID !== state.currentLectureID);
     state.pendingAudioTime = Number(timed.dataset.time);
-    if (targetLectureID) state.currentLectureID = targetLectureID;
+    if (targetLectureID) selectLecture(targetLectureID);
     if (state.route !== "detail" || requiresLectureChange) {
       setRoute("detail");
       return;
     }
     applyPendingAudioJump();
   });
+  document.addEventListener("change", async event => {
+    const kind = event.target?.dataset?.select;
+    if (kind === "course") { selectCourse(event.target.value); render(); }
+    if (kind === "lecture") { selectLecture(event.target.value); render(); }
+  });
   document.querySelectorAll("[data-close-dialog]").forEach(b => b.addEventListener("click", () => b.closest("dialog").close()));
   document.getElementById("course-form").addEventListener("submit", saveCourse);
   document.getElementById("delete-course").addEventListener("click", async () => { const id = document.getElementById("course-form").elements.id.value; if (id && confirm("删除课程会同时删除课堂、逐字稿和总结。确定继续？")) { await api(`/api/courses/${id}`, { method: "DELETE" }); document.getElementById("course-dialog").close(); await reload(); } });
-  document.getElementById("key-form").addEventListener("submit", async event => { event.preventDefault(); const value = new FormData(event.currentTarget).get("apiKey"); try { await api("/api/deepseek/key", { method: "POST", body: JSON.stringify({ apiKey: value }) }); event.currentTarget.reset(); document.getElementById("key-dialog").close(); toast("密钥已安全保存并通过连接测试"); await reload(); } catch (e) { toast(e.message, true); } });
+  document.getElementById("key-form").addEventListener("submit", async event => { event.preventDefault(); const value = new FormData(event.currentTarget).get("apiKey"); try { await api("/api/ai/key", { method: "POST", body: JSON.stringify({ apiKey: value }) }); event.currentTarget.reset(); document.getElementById("key-dialog").close(); toast("密钥已安全保存并通过连接测试"); await refreshAIConfiguration(); renderSettings(); } catch (e) { toast(e.message, true); } });
   window.addEventListener("hashchange", () => { state.route = location.hash.slice(1) || "live"; render(); });
   document.addEventListener("keydown", e => { if (/^[1-5]$/.test(e.key) && !/INPUT|TEXTAREA|SELECT/.test(e.target.tagName)) setRoute(["live","history","summary","qa","settings"][Number(e.key)-1]); });
   setInterval(() => { const clock = document.getElementById("clock"); const now = new Date(); clock.dateTime = now.toISOString(); clock.textContent = now.toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit" }); }, 1000);

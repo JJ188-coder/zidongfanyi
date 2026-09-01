@@ -30,7 +30,9 @@ public enum TranscriptPreference {
         let matching = corrected.filter { segment in
             segment.sourceSegmentID.map(preferredSourceIDs.contains) == true
         }
-        return matching.count == corrected.count ? corrected : live
+        let correctedSourceIDs = Set(matching.compactMap(\.sourceSegmentID))
+        let coversPreferredEnglish = preferredSourceIDs.isSubset(of: correctedSourceIDs)
+        return matching.count == corrected.count && coversPreferredEnglish ? corrected : live
     }
 
     public static func characterCount(_ segments: [TranscriptSegment]) -> Int {

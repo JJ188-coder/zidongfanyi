@@ -41,7 +41,7 @@
           </button>
           <button class="nav-item" type="button" data-route="qa">
             <svg aria-hidden="true"><use href="#icon-chat"></use></svg>
-            <span>DeepSeek 问答</span>
+            <span>AI 问答</span>
             <kbd>4</kbd>
           </button>
           <button class="nav-item" type="button" data-route="settings">
@@ -155,16 +155,16 @@
         <header class="modal-head">
           <div>
             <span class="eyebrow">MACOS KEYCHAIN</span>
-            <h2 id="key-dialog-title">更换 DeepSeek 密钥</h2>
+            <h2 id="key-dialog-title">保存 AI 服务密钥</h2>
           </div>
           <button class="icon-button" type="button" data-close-dialog aria-label="关闭">
             <svg aria-hidden="true"><use href="#icon-close"></use></svg>
           </button>
         </header>
-        <p class="modal-copy">密钥会直接交给本机助手并写入 macOS 钥匙串；网页不会保存或再次显示完整内容。</p>
+        <p class="modal-copy">在这个网页输入一次即可。Lecture 会在本机安全保存密钥，以后不会反复要求输入，也不会再次显示完整内容。</p>
         <label class="field field-wide">
-          <span>DeepSeek API Key</span>
-          <input name="apiKey" type="password" autocomplete="new-password" spellcheck="false" required placeholder="sk-••••••••••••••••">
+          <span>API Key</span>
+          <input name="apiKey" type="password" autocomplete="new-password" spellcheck="false" required placeholder="只保存，不会回显">
         </label>
         <footer class="modal-actions">
           <button class="button button-quiet" type="button" data-close-dialog>取消</button>

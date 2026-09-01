@@ -103,11 +103,11 @@ public enum DeepSeekError: Error, CustomStringConvertible {
     case unsupportedCitation(String)
     public var description: String {
         switch self {
-        case .missingAPIKey: return "请先在设置中保存 DeepSeek API Key"
+        case .missingAPIKey: return "请先在设置中保存当前 AI 服务的 API Key"
         case .missingTranscript: return "没有可用于课后处理的英文逐字稿"
-        case .invalidResponse(let message): return "DeepSeek 返回格式异常：" + SecretRedactor.redact(message)
-        case .http(let code, let message): return "DeepSeek 请求失败（\(code)）：" + SecretRedactor.redact(message)
-        case .unsupportedCitation(let id): return "DeepSeek 返回了不存在的引用：" + id
+        case .invalidResponse(let message): return "AI 服务返回格式异常：" + SecretRedactor.redact(message)
+        case .http(let code, let message): return "AI 服务请求失败（\(code)）：" + SecretRedactor.redact(message)
+        case .unsupportedCitation(let id): return "AI 服务返回了不存在的引用：" + id
         }
     }
 }
@@ -178,6 +178,28 @@ private struct FlexibleStringList: Decodable {
             }
             return
         }
+        if let dictionaries = try? container.decode([[String: String]].self) {
+            values = dictionaries.flatMap { dictionary in
+                dictionary.keys.sorted().compactMap { key in
+                    let value = dictionary[key]?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+                    guard !key.isEmpty || !value.isEmpty else { return nil }
+                    return value.isEmpty ? key : "\(key)：\(value)"
+                }
+            }
+            return
+        }
+        if let numbers = try? container.decode([Double].self) {
+            values = numbers.map { String($0) }
+            return
+        }
+        if let dictionary = try? container.decode([String: FlexibleScalar].self) {
+            values = dictionary.keys.sorted().compactMap { key in
+                let value = dictionary[key]?.text.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+                guard !key.isEmpty || !value.isEmpty else { return nil }
+                return value.isEmpty ? key : "\(key)：\(value)"
+            }
+            return
+        }
         if let string = try? container.decode(String.self) {
             let value = string.trimmingCharacters(in: .whitespacesAndNewlines)
             values = value.isEmpty ? [] : [value]
@@ -190,8 +212,49 @@ private struct FlexibleStringList: Decodable {
     }
 }
 
+private struct FlexibleScalar: Decodable {
+    let text: String
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.singleValueContainer()
+        if container.decodeNil() { text = ""; return }
+        if let string = try? container.decode(String.self) { text = string; return }
+        if let number = try? container.decode(Double.self) { text = String(number); return }
+        if let boolean = try? container.decode(Bool.self) { text = String(boolean); return }
+        throw DecodingError.typeMismatch(
+            String.self,
+            .init(codingPath: decoder.codingPath, debugDescription: "Expected a scalar value")
+        )
+    }
+}
+
 private struct FlexibleGlossary: Decodable {
     let values: [GlossaryTerm]
+
+    private struct FlexibleTerm: Decodable {
+        let english: String
+        let chinese: String
+        let explanation: String
+
+        private enum CodingKeys: String, CodingKey {
+            case english, term, word, chinese, translation, meaning, explanation, definition
+        }
+
+        init(from decoder: Decoder) throws {
+            let container = try decoder.container(keyedBy: CodingKeys.self)
+            english = try container.decodeIfPresent(String.self, forKey: .english)
+                ?? (try container.decodeIfPresent(String.self, forKey: .term))
+                ?? (try container.decodeIfPresent(String.self, forKey: .word))
+                ?? ""
+            chinese = try container.decodeIfPresent(String.self, forKey: .chinese)
+                ?? (try container.decodeIfPresent(String.self, forKey: .translation))
+                ?? (try container.decodeIfPresent(String.self, forKey: .meaning))
+                ?? ""
+            explanation = try container.decodeIfPresent(String.self, forKey: .explanation)
+                ?? (try container.decodeIfPresent(String.self, forKey: .definition))
+                ?? ""
+        }
+    }
 
     init(from decoder: Decoder) throws {
         let container = try decoder.singleValueContainer()
@@ -203,6 +266,17 @@ private struct FlexibleGlossary: Decodable {
         if let dictionary = try? container.decode([String: String].self) {
             values = dictionary.keys.sorted().map {
                 GlossaryTerm(english: $0, chinese: dictionary[$0] ?? "")
+            }
+            return
+        }
+        if let terms = try? container.decode([FlexibleTerm].self) {
+            values = terms.compactMap { term in
+                guard !term.english.isEmpty || !term.chinese.isEmpty else { return nil }
+                return GlossaryTerm(
+                    english: term.english,
+                    chinese: term.chinese,
+                    explanation: term.explanation
+                )
             }
             return
         }

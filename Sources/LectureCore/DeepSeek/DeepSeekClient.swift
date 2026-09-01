@@ -5,17 +5,33 @@ import FoundationNetworking
 
 public final class DeepSeekClient: @unchecked Sendable {
     public static let endpoint = URL(string: "https://api.deepseek.com/chat/completions")!
-    public static let model = "deepseek-v4-pro"
-    private let keyProvider: DeepSeekAPIKeyProviding
-    private let session: URLSession
+    public static let model = AIProviderConfiguration.deepSeekV4Flash.model
 
-    public init(keyProvider: DeepSeekAPIKeyProviding = DeepSeekKeychainStore(), session: URLSession = .shared) {
-        self.keyProvider = keyProvider; self.session = session
+    private let keyProvider: DeepSeekAPIKeyProviding
+    private let configurationProvider: AIProviderConfigurationProviding
+    private let session: URLSession
+    private let sessionIsShared: Bool
+
+    public init(
+        keyProvider: DeepSeekAPIKeyProviding = DeepSeekKeychainStore(),
+        configurationProvider: AIProviderConfigurationProviding = AIProviderConfigurationStore(),
+        session: URLSession = .shared
+    ) {
+        self.keyProvider = keyProvider
+        self.configurationProvider = configurationProvider
+        self.session = session
+        sessionIsShared = session === URLSession.shared
     }
 
     public func testConnection() async throws -> DeepSeekConnectionStatus {
-        _ = try await complete(system: "Reply with only OK.", user: "Connection test", jsonMode: false)
-        return .init(isConnected: true, message: "DeepSeek 连接正常")
+        let configuration = try configurationProvider.loadConfiguration()
+        _ = try await complete(
+            system: "Reply with only OK.",
+            user: "Connection test",
+            jsonMode: false,
+            timeout: 15
+        )
+        return .init(isConnected: true, message: "\(configuration.name) 连接正常")
     }
 
     public func correctTranslation(englishSegments: [TranscriptSegment], vocabulary: [String]) async throws -> [TranscriptSegment] {
@@ -80,14 +96,40 @@ public final class DeepSeekClient: @unchecked Sendable {
         let chunks = DeepSeekTranscriptChunker.chunks(from: transcript)
         if chunks.count <= 1 {
             let text = transcript.map { "[\(format($0.startTime))] \($0.text)" }.joined(separator: "\n")
-            return try DeepSeekResponseParser.studySummary(from: await complete(system: summaryPrompt, user: "Lecture: \(lectureTitle)\n\n\(text)"))
+            return try await requestStudySummary(user: "Lecture: \(lectureTitle)\n\n\(text)")
         }
         var partials: [StudySummary] = []
         for chunk in chunks {
             let text = chunk.units.map { "[\(format($0.startTime))] \($0.text)" }.joined(separator: "\n")
-            partials.append(try DeepSeekResponseParser.studySummary(from: await complete(system: summaryPrompt, user: "Lecture: \(lectureTitle), partial transcript\n\n\(text)")))
+            partials.append(try await requestStudySummary(user: "Lecture: \(lectureTitle), partial transcript\n\n\(text)"))
         }
-        return try DeepSeekResponseParser.studySummary(from: await complete(system: summaryPrompt + " Merge the partial summaries without repetition.", user: try jsonString(partials)))
+        return try await requestStudySummary(
+            system: summaryPrompt + " Merge the partial summaries without repetition.",
+            user: try jsonString(partials)
+        )
+    }
+
+    private func requestStudySummary(
+        system: String? = nil,
+        user: String
+    ) async throws -> StudySummary {
+        var lastError: Error?
+        for attempt in 0..<3 {
+            do {
+                let repairInstruction = attempt == 0 ? "" : " Every list field must be a JSON array of strings or null. Do not return nested objects in list fields."
+                let raw = try await complete(
+                    system: (system ?? summaryPrompt) + repairInstruction,
+                    user: user
+                )
+                return try DeepSeekResponseParser.studySummary(from: raw)
+            } catch {
+                lastError = error
+                if attempt < 2 {
+                    try? await Task.sleep(for: .milliseconds(Int64(500 * (attempt + 1))))
+                }
+            }
+        }
+        throw lastError ?? DeepSeekError.invalidResponse("总结生成失败")
     }
 
     public func answer(question: String, evidence: [GroundingEvidence]) async throws -> GroundedAnswer {
@@ -111,34 +153,168 @@ public final class DeepSeekClient: @unchecked Sendable {
         return try DeepSeekResponseParser.groundedAnswer(from: raw, evidence: unique)
     }
 
-    private func complete(system: String, user: String, jsonMode: Bool = true) async throws -> String {
-        guard let key = try keyProvider.loadAPIKey(), !key.isEmpty else { throw DeepSeekError.missingAPIKey }
+    private func complete(
+        system: String,
+        user: String,
+        jsonMode: Bool = true,
+        timeout: TimeInterval = 45
+    ) async throws -> String {
+        let configuration = try configurationProvider.loadConfiguration().validated()
+        let key = try keyProvider.loadAPIKey()?.trimmingCharacters(in: .whitespacesAndNewlines)
+        if configuration.requiresAPIKey, key?.isEmpty != false { throw DeepSeekError.missingAPIKey }
+
         struct Message: Encodable { let role: String; let content: String }
-        struct Request: Encodable { let model: String; let messages: [Message]; let stream: Bool; let thinking: Thinking; let responseFormat: ResponseFormat?; enum CodingKeys: String, CodingKey { case model, messages, stream, thinking; case responseFormat = "response_format" }; struct Thinking: Encodable { let type: String }; struct ResponseFormat: Encodable { let type: String } }
-        var request = URLRequest(url: Self.endpoint)
+        struct Thinking: Encodable { let type: String }
+        struct ResponseFormat: Encodable { let type: String }
+        struct Request: Encodable {
+            let model: String
+            let messages: [Message]
+            let stream: Bool
+            let thinking: Thinking?
+            let responseFormat: ResponseFormat?
+
+            enum CodingKeys: String, CodingKey {
+                case model, messages, stream, thinking
+                case responseFormat = "response_format"
+            }
+        }
+
+        let responseFormat = jsonMode && configuration.supportsJSONResponseFormat
+            ? ResponseFormat(type: "json_object") : nil
+        let thinking = configuration.sendThinkingDisabled ? Thinking(type: "disabled") : nil
+        var request = URLRequest(url: try configuration.chatCompletionsURL())
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.setValue("Bearer \(key)", forHTTPHeaderField: "Authorization")
-        request.timeoutInterval = 90
-        request.httpBody = try JSONEncoder().encode(Request(model: Self.model, messages: [.init(role: "system", content: system), .init(role: "user", content: user)], stream: false, thinking: .init(type: "disabled"), responseFormat: jsonMode ? .init(type: "json_object") : nil))
-        let (data, response) = try await session.data(for: request)
+        if let key, !key.isEmpty { request.setValue("Bearer \(key)", forHTTPHeaderField: "Authorization") }
+        request.timeoutInterval = timeout
+        request.httpBody = try JSONEncoder().encode(Request(
+            model: configuration.model,
+            messages: [
+                .init(role: "system", content: system),
+                .init(role: "user", content: user),
+            ],
+            stream: false,
+            thinking: thinking,
+            responseFormat: responseFormat
+        ))
+
+        let requestSession: URLSession
+        if sessionIsShared {
+            let sessionConfiguration = URLSessionConfiguration.ephemeral
+            sessionConfiguration.waitsForConnectivity = false
+            sessionConfiguration.timeoutIntervalForRequest = timeout
+            sessionConfiguration.timeoutIntervalForResource = timeout
+            requestSession = URLSession(configuration: sessionConfiguration)
+        } else {
+            requestSession = session
+        }
+        let (data, response) = try await requestData(
+            request,
+            using: requestSession,
+            timeout: timeout
+        )
         guard let http = response as? HTTPURLResponse else { throw DeepSeekError.invalidResponse("没有 HTTP 响应") }
-        guard (200..<300).contains(http.statusCode) else { throw DeepSeekError.http(http.statusCode, String(data: data, encoding: .utf8) ?? "未知错误") }
-        struct Envelope: Decodable { struct Choice: Decodable { struct Message: Decodable { let content: String }; let message: Message; let finishReason: String?; enum CodingKeys: String, CodingKey { case message; case finishReason = "finish_reason" } }; let choices: [Choice] }
+        guard (200..<300).contains(http.statusCode) else {
+            throw DeepSeekError.http(http.statusCode, String(data: data, encoding: .utf8) ?? "未知错误")
+        }
+        struct Envelope: Decodable {
+            struct Choice: Decodable {
+                struct Message: Decodable { let content: String }
+                let message: Message
+                let finishReason: String?
+                enum CodingKeys: String, CodingKey { case message; case finishReason = "finish_reason" }
+            }
+            let choices: [Choice]
+        }
         do {
             let value = try JSONDecoder().decode(Envelope.self, from: data)
             guard let choice = value.choices.first else { throw DeepSeekError.invalidResponse("没有内容") }
             guard choice.finishReason != "length" else { throw DeepSeekError.invalidResponse("输出被截断，请重试") }
-            let content = choice.message.content
-            return content
-        } catch let error as DeepSeekError { throw error }
-        catch { throw DeepSeekError.invalidResponse(String(describing: error)) }
+            return choice.message.content
+        } catch let error as DeepSeekError {
+            throw error
+        } catch {
+            throw DeepSeekError.invalidResponse(String(describing: error))
+        }
     }
 
-    private func jsonString<T: Encodable>(_ value: T) throws -> String { String(data: try JSONEncoder().encode(value), encoding: .utf8) ?? "[]" }
-    private func format(_ seconds: TimeInterval) -> String { String(format: "%02d:%02d", Int(seconds) / 60, Int(seconds) % 60) }
+    private func requestData(
+        _ request: URLRequest,
+        using session: URLSession,
+        timeout: TimeInterval
+    ) async throws -> (Data, URLResponse) {
+        try await withCheckedThrowingContinuation { continuation in
+            let gate = URLSessionContinuationGate(continuation)
+            let task = session.dataTask(with: request) { data, response, error in
+                if let error {
+                    gate.resume(throwing: error)
+                } else if let data, let response {
+                    gate.resume(returning: (data, response))
+                } else {
+                    gate.resume(throwing: URLError(.badServerResponse))
+                }
+            }
+            gate.setTask(task)
+            task.resume()
+            DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + timeout) {
+                gate.timeout()
+            }
+        }
+    }
+
+    private func jsonString<T: Encodable>(_ value: T) throws -> String {
+        String(data: try JSONEncoder().encode(value), encoding: .utf8) ?? "[]"
+    }
+
+    private func format(_ seconds: TimeInterval) -> String {
+        String(format: "%02d:%02d", Int(seconds) / 60, Int(seconds) % 60)
+    }
+
     private var summaryPrompt: String {
         "Create a faithful Chinese study summary from the transcript. Do not invent facts. Return only JSON with keys overview, coreConcepts, definitions, professorExamples, professorEmphasis, possibleExamTopics, unresolvedQuestions, glossary. glossary items use english, chinese, explanation. Possible exam topics are suggestions, not claims."
+    }
+}
+
+private final class URLSessionContinuationGate: @unchecked Sendable {
+    private let lock = NSLock()
+    private var continuation: CheckedContinuation<(Data, URLResponse), Error>?
+    private var task: URLSessionDataTask?
+
+    init(_ continuation: CheckedContinuation<(Data, URLResponse), Error>) {
+        self.continuation = continuation
+    }
+
+    func setTask(_ task: URLSessionDataTask) {
+        lock.lock()
+        if continuation == nil {
+            lock.unlock()
+            task.cancel()
+            return
+        }
+        self.task = task
+        lock.unlock()
+    }
+
+    func resume(returning value: (Data, URLResponse)) {
+        take()?.resume(returning: value)
+    }
+
+    func resume(throwing error: Error) {
+        take()?.resume(throwing: error)
+    }
+
+    func timeout() {
+        let continuation = take()
+        task?.cancel()
+        continuation?.resume(throwing: URLError(.timedOut))
+    }
+
+    private func take() -> CheckedContinuation<(Data, URLResponse), Error>? {
+        lock.lock()
+        defer { lock.unlock() }
+        let value = continuation
+        continuation = nil
+        return value
     }
 }
 
