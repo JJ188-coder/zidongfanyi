@@ -69,11 +69,19 @@ public struct LecturePermissionAuthorizer: Sendable {
     }
 
     public func authorize() async throws {
+        try await authorizeMicrophone()
+        try await authorizeSpeechRecognition()
+    }
+
+    public func authorizeMicrophone() async throws {
         try await authorize(
             .microphone,
             currentStatus: microphoneStatus,
             requester: requestMicrophone
         )
+    }
+
+    public func authorizeSpeechRecognition() async throws {
         try await authorize(
             .speechRecognition,
             currentStatus: speechRecognitionStatus,

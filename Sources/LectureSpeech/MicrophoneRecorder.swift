@@ -18,9 +18,10 @@ public final class MicrophoneRecorder: @unchecked Sendable {
     private var outputURL: URL?
     private var sampleRate = 0.0
     private var recordedFrames: Int64 = 0
+    private var tapInstalled = false
 
     public init() {}
-    public var isRecording: Bool { engine.isRunning }
+    public var isRecording: Bool { startedAt != nil }
     public var duration: TimeInterval { startedAt.map { Date().timeIntervalSince($0) } ?? 0 }
     public var inputFormat: AVAudioFormat { engine.inputNode.inputFormat(forBus: 0) }
 
@@ -44,18 +45,12 @@ public final class MicrophoneRecorder: @unchecked Sendable {
         onCheckpoint: CheckpointHandler? = nil,
         onError: ErrorHandler? = nil
     ) throws {
-        guard !engine.isRunning else { throw RecorderError.alreadyRecording }
+        guard !engine.isRunning, !tapInstalled else { throw RecorderError.alreadyRecording }
         try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
         let input = engine.inputNode
         let format = input.inputFormat(forBus: 0)
         guard format.sampleRate > 0, format.channelCount > 0 else { throw RecorderError.noMicrophone }
-        let settings: [String: Any] = [
-            AVFormatIDKey: kAudioFormatMPEG4AAC,
-            AVSampleRateKey: format.sampleRate,
-            AVNumberOfChannelsKey: Int(format.channelCount),
-            AVEncoderBitRateKey: 128_000,
-            AVEncoderAudioQualityKey: AVAudioQuality.high.rawValue,
-        ]
+        let settings = Self.recordingSettings(for: format)
         file = try AVAudioFile(
             forWriting: url,
             settings: settings,
@@ -94,12 +89,14 @@ public final class MicrophoneRecorder: @unchecked Sendable {
                 self.bufferHandler?(copy)
             }
         }
+        tapInstalled = true
         do {
             engine.prepare()
             try engine.start()
+            guard engine.isRunning else { throw RecorderError.engineStopped }
             startedAt = Date()
         } catch {
-            input.removeTap(onBus: 0)
+            if tapInstalled { input.removeTap(onBus: 0); tapInstalled = false }
             queue.sync {
                 file = nil
                 bufferHandler = nil
@@ -115,13 +112,15 @@ public final class MicrophoneRecorder: @unchecked Sendable {
     }
 
     @discardableResult public func stop() -> TimeInterval {
-        let value = duration
-        if engine.isRunning { engine.inputNode.removeTap(onBus: 0); engine.stop() }
+        var value = duration
+        if tapInstalled { engine.inputNode.removeTap(onBus: 0); tapInstalled = false }
+        if engine.isRunning { engine.stop() }
         queue.sync {
             if let outputURL {
                 let recordedDuration = sampleRate > 0
                     ? Double(recordedFrames) / sampleRate
                     : value
+                value = recordedDuration
                 checkpointHandler?(RecordingCheckpoint(
                     outputURL: outputURL,
                     elapsedTime: recordedDuration,
@@ -151,6 +150,19 @@ public final class MicrophoneRecorder: @unchecked Sendable {
         }
         return result
     }
+
+    public static func recordingSettings(for format: AVAudioFormat) -> [String: Any] {
+        var settings: [String: Any] = [
+            AVFormatIDKey: kAudioFormatMPEG4AAC,
+            AVSampleRateKey: format.sampleRate,
+            AVNumberOfChannelsKey: Int(format.channelCount),
+            AVEncoderAudioQualityKey: AVAudioQuality.high.rawValue,
+        ]
+        if format.sampleRate >= 32_000 {
+            settings[AVEncoderBitRateKey] = 128_000
+        }
+        return settings
+    }
 }
 
 public struct RecordingCheckpoint: Codable, Hashable, Sendable {
@@ -173,6 +185,12 @@ public struct RecordingCheckpoint: Codable, Hashable, Sendable {
 }
 
 public enum RecorderError: Error, CustomStringConvertible {
-    case alreadyRecording, noMicrophone
-    public var description: String { self == .alreadyRecording ? "已有课堂正在录音" : "没有检测到可用麦克风" }
+    case alreadyRecording, noMicrophone, engineStopped
+    public var description: String {
+        switch self {
+        case .alreadyRecording: "已有课堂正在录音"
+        case .noMicrophone: "没有检测到可用麦克风"
+        case .engineStopped: "麦克风启动后立即停止，请重新连接或切换输入设备后重试"
+        }
+    }
 }

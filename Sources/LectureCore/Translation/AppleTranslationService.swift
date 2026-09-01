@@ -33,3 +33,16 @@ public actor AppleTranslationService: LectureTranslationServing {
         return try await active.translate(text).targetText
     }
 }
+
+@available(macOS 26.4, *)
+public extension AppleTranslationService {
+    static let settingsURL = URL(string: "x-apple.systempreferences:com.apple.Localization-Settings.extension?translation")!
+
+    static func userMessage(for error: Error) -> String {
+        if TranslationError.notInstalled ~= error {
+            return "实时翻译需要先下载英语（美国）和中文（普通话，简体）的离线语言包"
+        }
+        let localized = error.localizedDescription.trimmingCharacters(in: .whitespacesAndNewlines)
+        return localized.isEmpty ? "实时翻译暂不可用" : "实时翻译暂不可用：\(localized)"
+    }
+}

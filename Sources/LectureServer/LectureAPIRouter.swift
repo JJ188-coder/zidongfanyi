@@ -11,6 +11,7 @@ public protocol LectureRuntimeControlling: Sendable {
     func saveDeepSeekKey(_ key: String) async throws
     func deleteDeepSeekKey() throws
     func testDeepSeek() async throws -> Bool
+    func openTranslationSettings()
     func isDeepSeekConfigured() -> Bool
     func storageUsage() throws -> LectureStorageUsage
 }
@@ -18,6 +19,7 @@ public protocol LectureRuntimeControlling: Sendable {
 public extension LectureRuntimeControlling {
     func reviewedTranscript(lectureID: String) async throws -> [TranscriptSegment] { [] }
     func storageUsage() throws -> LectureStorageUsage { LectureStorageUsage() }
+    func openTranslationSettings() {}
 }
 
 public struct RuntimeSnapshot: Codable, Sendable {
@@ -118,6 +120,9 @@ public final class LectureAPIRouter: @unchecked Sendable {
             return .json(["ok": true])
         case ("POST", "/api/deepseek/test"):
             return .json(["ok": try await runtime.testDeepSeek()])
+        case ("POST", "/api/translation/settings"):
+            runtime.openTranslationSettings()
+            return .json(["ok": true])
         case ("POST", "/api/qa"):
             struct Input: Decodable { let question: String; let courseID: String; let lectureID: String? }
             let input = try decode(Input.self, from: request.body)

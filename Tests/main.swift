@@ -612,7 +612,8 @@ func testWebSecurityContract() throws {
         encoding: .utf8
     )
     try expect(
-        buildScript.contains(#"designated => identifier "com.jiyuanyi.Lecture""#),
+        buildScript.contains(#"designated => identifier "com.jiyuanyi.Lecture""#)
+            && buildScript.contains(#"--identifier com.jiyuanyi.Lecture.whisper-cli"#),
         "packaged builds must keep a stable designated requirement so macOS permissions survive updates"
     )
 

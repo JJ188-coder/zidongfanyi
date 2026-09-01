@@ -1,3 +1,4 @@
+import AppKit
 import Foundation
 import LectureCore
 import LectureServer
@@ -30,7 +31,7 @@ final class LectureCoordinator: LectureRuntimeControlling, @unchecked Sendable {
         deepSeekConfiguredValue = deepSeekConfigured
         Task { [weak self] in
             guard let self else { return }
-            let speechAvailable = (try? await SpeechAssetManager.resolvedLocale()) != nil
+            let speechAvailable = LiveSpeechTranscriber.isAvailable
             let translationAvailable = await translation.isAvailable()
             self.withState {
                 self.speechAvailableValue = speechAvailable
@@ -44,11 +45,17 @@ final class LectureCoordinator: LectureRuntimeControlling, @unchecked Sendable {
     }
 
     func runtimeSnapshot() throws -> RuntimeSnapshot {
-        withState { RuntimeSnapshot(recording: recorder.isRecording, activeLectureID: activeLecture?.id, duration: recorder.isRecording ? recorder.duration : durationValue, audioLevel: audioLevelValue, volatileEnglish: volatileEnglishValue, volatileChinese: volatileChineseValue, speechAvailable: speechAvailableValue, translationAvailable: translationAvailableValue, deepSeekConfigured: deepSeekConfiguredValue, statusMessage: statusMessageValue) }
+        let recording = recorder.isRecording
+        return withState { RuntimeSnapshot(recording: activeLecture != nil && recording, activeLectureID: activeLecture?.id, duration: recording ? recorder.duration : durationValue, audioLevel: recording ? audioLevelValue : 0, volatileEnglish: volatileEnglishValue, volatileChinese: volatileChineseValue, speechAvailable: speechAvailableValue, translationAvailable: translationAvailableValue, deepSeekConfigured: deepSeekConfiguredValue, statusMessage: statusMessageValue) }
     }
 
     func isDeepSeekConfigured() -> Bool { withState { deepSeekConfiguredValue } }
     func storageUsage() throws -> LectureStorageUsage { try paths.storageUsage() }
+    func openTranslationSettings() {
+        DispatchQueue.main.async {
+            NSWorkspace.shared.open(AppleTranslationService.settingsURL)
+        }
+    }
 
     func startLecture(courseID: String, title: String?) async throws -> LectureRecord {
         let canStart = withState { () -> Bool in
@@ -59,12 +66,13 @@ final class LectureCoordinator: LectureRuntimeControlling, @unchecked Sendable {
         guard canStart else { throw CoordinatorError.alreadyRecording }
         defer { withState { operationInProgress = false } }
         do {
-            withState { statusMessageValue = "正在检查麦克风与语音识别权限…" }
-            try await LecturePermissionAuthorizer().authorize()
+            withState { statusMessageValue = "正在检查麦克风权限…" }
+            try await LecturePermissionAuthorizer().authorizeMicrophone()
             guard let course = try repository.course(id: courseID) else { throw CoordinatorError.missingCourse }
             try ensureRecordingCapacity()
-            withState { statusMessageValue = "正在准备本地英语识别资源…" }
-            let speechLocale = try await SpeechAssetManager.ensureInstalled(
+            withState { statusMessageValue = "正在准备本地 Whisper 英语识别…" }
+            guard LiveSpeechTranscriber.isAvailable else { throw CoordinatorError.missingWhisper }
+            let speechLocale = SpeechAssetManager.requestedLocale(
                 identifier: course.speechLocaleIdentifier
             )
             withState { speechAvailableValue = true }
@@ -74,7 +82,17 @@ final class LectureCoordinator: LectureRuntimeControlling, @unchecked Sendable {
             let liveSpeech = LiveSpeechTranscriber(vocabulary: course.vocabulary, locale: speechLocale)
             withState { activeLecture = lecture; activeCourse = course; speech = liveSpeech; durationValue = 0; volatileEnglishValue = ""; volatileChineseValue = ""; statusMessageValue = "本地录音与英文识别正在运行" }
             do {
-                try await liveSpeech.start(lectureID: lecture.id, audioFormat: recorder.inputFormat) { [weak self] update in self?.receive(update) }
+                try await liveSpeech.start(
+                    lectureID: lecture.id,
+                    audioFormat: recorder.inputFormat,
+                    handler: { [weak self] update in self?.receive(update) },
+                    onError: { [weak self] error in
+                        guard let self else { return }
+                        self.withState {
+                            self.statusMessageValue = "录音正常；本地英文识别警告：\(SecretRedactor.redact(String(describing: error)))"
+                        }
+                    }
+                )
                 try recorder.start(
                     url: audioURL,
                     onBuffer: { [weak liveSpeech] buffer in liveSpeech?.append(buffer) },
@@ -177,7 +195,13 @@ final class LectureCoordinator: LectureRuntimeControlling, @unchecked Sendable {
                 let chinese = try await translation.translate(update.segment.text)
                 let segment = TranscriptSegment(lectureID: update.segment.lectureID, source: .liveChinese, startTime: update.segment.startTime, endTime: update.segment.endTime, text: chinese, isFinal: true, sourceSegmentID: update.segment.id)
                 try repository.appendTranscript(segment); withState { self.volatileChineseValue = chinese }
-            } catch { withState { self.statusMessageValue = "英文录音正常；实时翻译暂不可用" } }
+            } catch {
+                let message = AppleTranslationService.userMessage(for: error)
+                withState {
+                    self.translationAvailableValue = false
+                    self.statusMessageValue = "英文录音正常；\(message)"
+                }
+            }
         }
     }
 
@@ -189,14 +213,13 @@ final class LectureCoordinator: LectureRuntimeControlling, @unchecked Sendable {
             let reviewed: [TranscriptSegment]
             if existingReviewed.isEmpty {
                 if lecture.status != .reviewingEnglish { lecture.status = .reviewingEnglish; lecture.updatedAt = Date(); try repository.upsertLecture(lecture) }
-                let locale = try await SpeechAssetManager.ensureInstalled(identifier: course?.speechLocaleIdentifier)
-                reviewed = try await OfflineDictationTranscriber.review(
+                reviewed = try WhisperCLI().transcribeAudioFile(
                     audioURL: URL(fileURLWithPath: path),
                     lectureID: lecture.id,
-                    vocabulary: course?.vocabulary ?? [],
-                    locale: locale,
-                    customModelRoot: paths.speechModels
+                    source: .reviewedEnglish,
+                    vocabulary: course?.vocabulary ?? []
                 )
+                guard !reviewed.isEmpty else { throw CoordinatorError.emptyTranscript }
                 for segment in reviewed { try repository.appendTranscript(segment) }
             } else {
                 reviewed = existingReviewed
@@ -231,9 +254,9 @@ final class LectureCoordinator: LectureRuntimeControlling, @unchecked Sendable {
 }
 
 private enum CoordinatorError: Error, CustomStringConvertible {
-    case alreadyRecording, busy, notRecording, missingCourse, missingLecture, missingAudio, lowDiskSpace
+    case alreadyRecording, busy, notRecording, missingCourse, missingLecture, missingAudio, missingWhisper, emptyTranscript, lowDiskSpace
     var description: String {
-        switch self { case .alreadyRecording: return "已有课堂正在录音或正在切换状态"; case .busy: return "Lecture 正在切换课堂状态，请稍后再试"; case .notRecording: return "当前没有正在录音的课堂"; case .missingCourse: return "请先选择课程"; case .missingLecture: return "未找到课堂"; case .missingAudio: return "录音文件不存在"; case .lowDiskSpace: return "可用磁盘空间不足 1 GB，请先清理空间再开始课堂" }
+        switch self { case .alreadyRecording: return "已有课堂正在录音或正在切换状态"; case .busy: return "Lecture 正在切换课堂状态，请稍后再试"; case .notRecording: return "当前没有正在录音的课堂"; case .missingCourse: return "请先选择课程"; case .missingLecture: return "未找到课堂"; case .missingAudio: return "录音文件不存在"; case .missingWhisper: return "本地 Whisper 英语识别引擎或模型不可用，请重新安装 Lecture"; case .emptyTranscript: return "本地复核没有识别到英文，请确认录音中有人声后重试"; case .lowDiskSpace: return "可用磁盘空间不足 1 GB，请先清理空间再开始课堂" }
     }
 }
 

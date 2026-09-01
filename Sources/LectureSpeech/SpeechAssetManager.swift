@@ -29,8 +29,7 @@ public enum SpeechAssetManager {
         identifier: String? = nil
     ) async throws -> Locale {
         let requested = requestedLocale(identifier: identifier)
-        guard let locale = await SpeechTranscriber.supportedLocale(equivalentTo: requested),
-              await DictationTranscriber.supportedLocale(equivalentTo: requested) != nil else {
+        guard let locale = await DictationTranscriber.supportedLocale(equivalentTo: requested) else {
             throw AssetError.unsupportedLocale(requested.identifier)
         }
         return locale
@@ -42,7 +41,6 @@ public enum SpeechAssetManager {
     ) async throws -> Locale {
         let locale = try await resolvedLocale(identifier: identifier)
         let modules: [any SpeechModule] = [
-            LiveSpeechTranscriber.makeSpeechTranscriber(locale: locale),
             OfflineDictationTranscriber.makeDictationTranscriber(locale: locale),
         ]
         switch await AssetInventory.status(forModules: modules) {

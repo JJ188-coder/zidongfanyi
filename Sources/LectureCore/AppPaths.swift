@@ -29,6 +29,9 @@ public struct AppPaths: Sendable {
     public let exports: URL
     public let working: URL
     public let speechModels: URL
+    public let whisper: URL
+    public let whisperModel: URL
+    public let whisperWorking: URL
 
     public init(root: URL) {
         self.root = root
@@ -37,6 +40,9 @@ public struct AppPaths: Sendable {
         self.exports = root.appendingPathComponent("Exports", isDirectory: true)
         self.working = root.appendingPathComponent("Working", isDirectory: true)
         self.speechModels = root.appendingPathComponent("SpeechModels", isDirectory: true)
+        self.whisper = root.appendingPathComponent("Whisper", isDirectory: true)
+        self.whisperModel = whisper.appendingPathComponent("ggml-base.en.bin")
+        self.whisperWorking = working.appendingPathComponent("Whisper", isDirectory: true)
     }
 
     public static var live: AppPaths {
@@ -50,11 +56,22 @@ public struct AppPaths: Sendable {
         try fileManager.createDirectory(at: exports, withIntermediateDirectories: true)
         try fileManager.createDirectory(at: working, withIntermediateDirectories: true)
         try fileManager.createDirectory(at: speechModels, withIntermediateDirectories: true)
+        try fileManager.createDirectory(at: whisper, withIntermediateDirectories: true)
+        try fileManager.createDirectory(at: whisperWorking, withIntermediateDirectories: true)
         try fileManager.setAttributes([.posixPermissions: 0o700], ofItemAtPath: root.path)
         try fileManager.setAttributes([.posixPermissions: 0o700], ofItemAtPath: recordings.path)
         try fileManager.setAttributes([.posixPermissions: 0o700], ofItemAtPath: exports.path)
         try fileManager.setAttributes([.posixPermissions: 0o700], ofItemAtPath: working.path)
         try fileManager.setAttributes([.posixPermissions: 0o700], ofItemAtPath: speechModels.path)
+        try fileManager.setAttributes([.posixPermissions: 0o700], ofItemAtPath: whisper.path)
+        try fileManager.setAttributes([.posixPermissions: 0o700], ofItemAtPath: whisperWorking.path)
+        if fileManager.fileExists(atPath: whisperModel.path) {
+            let values = try whisperModel.resourceValues(forKeys: [.isRegularFileKey, .isSymbolicLinkKey])
+            guard values.isRegularFile == true, values.isSymbolicLink != true else {
+                throw AppPathError.unsafeWhisperModel
+            }
+            try fileManager.setAttributes([.posixPermissions: 0o600], ofItemAtPath: whisperModel.path)
+        }
         for url in try fileManager.contentsOfDirectory(
             at: recordings,
             includingPropertiesForKeys: [.isRegularFileKey, .isSymbolicLinkKey],
@@ -116,5 +133,13 @@ public struct AppPaths: Sendable {
             }
         }
         return usage
+    }
+}
+
+public enum AppPathError: Error, CustomStringConvertible {
+    case unsafeWhisperModel
+
+    public var description: String {
+        "本地 Whisper 模型路径不安全，请重新安装 Lecture"
     }
 }

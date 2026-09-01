@@ -1,4 +1,5 @@
 import CoreMedia
+import AVFoundation
 import Foundation
 import LectureCore
 import LectureSpeech
@@ -42,6 +43,10 @@ public func testLectureSpeech() throws {
     try testVocabularyNormalization()
     try testCustomVocabularyFingerprint()
     try testSpeechConfigurations()
+    try testWhisperAudioConversion()
+    try testRecorderEncodingSettings()
+    try testWhisperWAVAndTranscriptParsing()
+    try testWhisperFileSmoke()
     try testLectureEnglishLocaleResolution()
     try testAudioLevels()
     try testCheckpointCadence()
@@ -110,6 +115,38 @@ public func testRecordingFilePermissions() throws {
     try speechExpect(permissions?.intValue == 0o600, "recordings should be readable only by the current user")
 }
 
+private func testRecorderEncodingSettings() throws {
+    let lowRate = try speechUnwrap(
+        AVAudioFormat(
+            commonFormat: .pcmFormatFloat32,
+            sampleRate: 16_000,
+            channels: 1,
+            interleaved: false
+        ),
+        "low-rate input format"
+    )
+    let lowSettings = MicrophoneRecorder.recordingSettings(for: lowRate)
+    try speechExpect(
+        lowSettings[AVEncoderBitRateKey] == nil,
+        "low-rate inputs must not force an unsupported AAC bit rate"
+    )
+
+    let standardRate = try speechUnwrap(
+        AVAudioFormat(
+            commonFormat: .pcmFormatFloat32,
+            sampleRate: 48_000,
+            channels: 1,
+            interleaved: false
+        ),
+        "standard-rate input format"
+    )
+    let standardSettings = MicrophoneRecorder.recordingSettings(for: standardRate)
+    try speechExpect(
+        standardSettings[AVEncoderBitRateKey] as? Int == 128_000,
+        "standard microphone formats should retain the configured AAC bit rate"
+    )
+}
+
 @available(macOS 26.0, *)
 private func testCustomVocabularyFingerprint() throws {
     let first = CustomVocabularyModel.fingerprint(
@@ -146,13 +183,6 @@ private func testLectureEnglishLocaleResolution() throws {
 
 @available(macOS 26.0, *)
 private func testSpeechConfigurations() throws {
-    let live = LiveSpeechTranscriber.makeSpeechPreset()
-    try speechExpect(live.reportingOptions.contains(.volatileResults), "live volatile results")
-    try speechExpect(live.reportingOptions.contains(.alternativeTranscriptions), "live alternatives")
-    try speechExpect(live.reportingOptions.contains(.fastResults), "live fast results")
-    try speechExpect(live.attributeOptions.contains(.audioTimeRange), "live audio time")
-    try speechExpect(live.attributeOptions.contains(.transcriptionConfidence), "live confidence")
-
     let context = SpeechAnalysisContextFactory.make(
         vocabulary: ["  Bayes   rule", "bayes rule", "Nash equilibrium"]
     )
@@ -166,6 +196,88 @@ private func testSpeechConfigurations() throws {
     try speechExpect(review.attributeOptions.contains(.audioTimeRange), "review audio time")
     try speechExpect(review.attributeOptions.contains(.transcriptionConfidence), "review confidence")
     try speechExpect(!review.reportingOptions.contains(.volatileResults), "review emits final results")
+}
+
+private func testWhisperAudioConversion() throws {
+    let sourceFormat = try speechUnwrap(
+        AVAudioFormat(
+            commonFormat: .pcmFormatFloat32,
+            sampleRate: 48_000,
+            channels: 1,
+            interleaved: false
+        ),
+        "Whisper source format"
+    )
+    let source = try speechUnwrap(
+        AVAudioPCMBuffer(pcmFormat: sourceFormat, frameCapacity: 4_800),
+        "Whisper source buffer"
+    )
+    source.frameLength = 4_800
+    if let samples = source.floatChannelData?[0] {
+        for index in 0..<Int(source.frameLength) {
+            samples[index] = sin(Float(index) * 0.09) * 0.25
+        }
+    }
+    let converted = try WhisperAudioConverter(sourceFormat: sourceFormat).convert(source)
+    try speechExpect(
+        converted.count >= 1_300 && converted.count <= 1_700,
+        "Whisper conversion should preserve the expected duration"
+    )
+    try speechExpect(converted.contains(where: { $0 != 0 }), "Whisper conversion should preserve sound")
+}
+
+private func testWhisperWAVAndTranscriptParsing() throws {
+    let wav = try WhisperWAVWriter.data(samples: [1, -2, 3, -4], sampleRate: 16_000)
+    try speechExpect(String(data: wav.prefix(4), encoding: .utf8) == "RIFF", "WAV RIFF header")
+    try speechExpect(String(data: wav[8..<12], encoding: .utf8) == "WAVE", "WAV format header")
+    try speechExpect(wav.count == 52, "WAV should contain a 44-byte header and PCM payload")
+
+    let json = #"{"transcription":[{"offsets":{"from":1200,"to":2450},"text":"  Hicksian demand. "},{"offsets":{"from":2450,"to":3000},"text":"   "}]}"#
+    let items = try WhisperTranscriptParser.parse(Data(json.utf8))
+    let segments = WhisperTranscriptParser.segments(
+        from: items,
+        lectureID: "whisper-lecture",
+        source: .reviewedEnglish,
+        timeOffset: 10,
+        maximumDuration: 2
+    )
+    try speechExpect(segments.count == 1, "blank Whisper segments should be discarded")
+    try speechExpect(segments[0].text == "Hicksian demand.", "Whisper text should be trimmed")
+    try speechExpectClose(segments[0].startTime, 11.2, "Whisper start timestamp")
+    try speechExpectClose(segments[0].endTime, 12, "Whisper end timestamp should be clamped to audio")
+    try speechExpect(segments[0].source == .reviewedEnglish, "Whisper source should be retained")
+}
+
+private func testWhisperFileSmoke() throws {
+    let executable = URL(fileURLWithPath: "/opt/homebrew/bin/whisper-cli")
+    let model = FileManager.default.homeDirectoryForCurrentUser
+        .appendingPathComponent("Library/Application Support/Lecture/Whisper/ggml-base.en.bin")
+    guard FileManager.default.isExecutableFile(atPath: executable.path),
+          FileManager.default.fileExists(atPath: model.path) else { return }
+
+    let root = FileManager.default.temporaryDirectory
+        .appendingPathComponent("LectureWhisperTest-\(UUID().uuidString)", isDirectory: true)
+    defer { try? FileManager.default.removeItem(at: root) }
+    let configuration = WhisperConfiguration(
+        executableURL: executable,
+        modelURL: model,
+        workingDirectory: root,
+        threadCount: 2
+    )
+    let wavURL = root.appendingPathComponent("silent.wav")
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+    try WhisperWAVWriter.data(samples: [Int16](repeating: 0, count: 16_000))
+        .write(to: wavURL, options: .atomic)
+    try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: wavURL.path)
+    let result = try WhisperCLI(configuration: configuration).transcribe(
+        audioURL: wavURL,
+        lectureID: "silent",
+        source: .liveEnglish,
+        vocabulary: []
+    )
+    try speechExpect(result.isEmpty, "silent Whisper input should not invent a transcript")
+    let leftovers = try FileManager.default.contentsOfDirectory(atPath: root.path)
+    try speechExpect(leftovers == ["silent.wav"], "Whisper result JSON should be removed after parsing")
 }
 
 private func testSegmentMapping() throws {
