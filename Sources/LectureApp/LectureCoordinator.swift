@@ -48,11 +48,12 @@ final class LectureCoordinator: LectureRuntimeControlling, @unchecked Sendable {
     }
 
     func runtimeSnapshot() throws -> RuntimeSnapshot {
-        let recording = recorder.isRecording
+        let recording = recorder.hasActiveSession
+        let receivingAudio = recorder.isReceivingAudio
         let duration = recorder.hasActiveSession ? recorder.duration : durationValue
         return withState {
             let level: Double
-            if recording, let updatedAt = audioLevelUpdatedAt {
+            if recording, receivingAudio, let updatedAt = audioLevelUpdatedAt {
                 let age = max(0, Date().timeIntervalSince(updatedAt))
                 level = age <= 0.25 ? audioLevelValue : audioLevelValue * exp(-(age - 0.25) * 3)
             } else {
@@ -70,7 +71,8 @@ final class LectureCoordinator: LectureRuntimeControlling, @unchecked Sendable {
                 deepSeekConfigured: deepSeekConfiguredValue,
                 statusMessage: statusMessageValue,
                 transitioning: transition != nil,
-                transitionKind: transition?.rawValue
+                transitionKind: transition?.rawValue,
+                receivingAudio: receivingAudio
             )
         }
     }
@@ -92,7 +94,6 @@ final class LectureCoordinator: LectureRuntimeControlling, @unchecked Sendable {
                 if transition != nil { return .wait }
                 if let activeLecture { return .existing(activeLecture) }
                 transition = .starting
-                lastStoppedLecture = nil
                 return .reserved
             }
             switch decision {
@@ -170,8 +171,12 @@ final class LectureCoordinator: LectureRuntimeControlling, @unchecked Sendable {
             case reserved(LectureRecord, Course?, LiveSpeechTranscriber?)
         }
         let deadline = Date().addingTimeInterval(60)
+        var requestedLectureID: String?
         reserve: while true {
             let reservation = withState { () -> StopReservation in
+                if let requestedLectureID, lastStoppedLecture?.id == requestedLectureID {
+                    return .stopped(lastStoppedLecture!)
+                }
                 if transition != nil { return .wait }
                 guard let activeLecture else {
                     return lastStoppedLecture.map(StopReservation.stopped) ?? .idle
@@ -181,6 +186,9 @@ final class LectureCoordinator: LectureRuntimeControlling, @unchecked Sendable {
             }
             switch reservation {
             case .wait:
+                if requestedLectureID == nil {
+                    requestedLectureID = withState { transition == .stopping ? activeLecture?.id : nil }
+                }
                 guard Date() < deadline else { throw CoordinatorError.busy }
                 try await Task.sleep(for: .milliseconds(40))
             case .idle: throw CoordinatorError.notRecording

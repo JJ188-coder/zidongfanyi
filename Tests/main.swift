@@ -588,6 +588,11 @@ func testWebSecurityContract() throws {
         "live transcripts should show newest items first without moving a reader who scrolled into older text"
     )
     try expect(
+        appJavaScript.contains("state.runtime.receivingAudio === false")
+            && appJavaScript.contains("未收到声音，请检查输入设备"),
+        "the live UI should distinguish an active lecture from a stalled microphone stream"
+    )
+    try expect(
         appJavaScript.contains("pendingAudioTime") && appJavaScript.contains("applyPendingAudioJump()"),
         "Q&A citations should carry their timestamp into the lecture audio player"
     )
@@ -631,6 +636,12 @@ func testWebSecurityContract() throws {
     try expect(
         coordinatorSource.contains("catch {\n            withState { statusMessageValue = SecretRedactor.redact(String(describing: error)) }\n            throw error\n        }"),
         "failed classroom startup should replace transient progress text with the safe actionable error"
+    )
+    try expect(
+        coordinatorSource.contains("let recording = recorder.hasActiveSession")
+            && coordinatorSource.contains("let receivingAudio = recorder.isReceivingAudio")
+            && coordinatorSource.contains("lastStoppedLecture?.id == requestedLectureID"),
+        "recording state must survive a quiet input stream and duplicate stop calls must return the same lecture"
     )
 
     let appSource = try String(

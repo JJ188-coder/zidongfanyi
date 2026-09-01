@@ -35,8 +35,9 @@ public struct RuntimeSnapshot: Codable, Sendable {
     public var statusMessage: String?
     public var transitioning: Bool
     public var transitionKind: String?
+    public var receivingAudio: Bool
 
-    public init(recording: Bool = false, activeLectureID: String? = nil, duration: TimeInterval = 0, audioLevel: Double = 0, volatileEnglish: String = "", volatileChinese: String = "", speechAvailable: Bool = true, translationAvailable: Bool = true, deepSeekConfigured: Bool = false, statusMessage: String? = nil, transitioning: Bool = false, transitionKind: String? = nil) {
+    public init(recording: Bool = false, activeLectureID: String? = nil, duration: TimeInterval = 0, audioLevel: Double = 0, volatileEnglish: String = "", volatileChinese: String = "", speechAvailable: Bool = true, translationAvailable: Bool = true, deepSeekConfigured: Bool = false, statusMessage: String? = nil, transitioning: Bool = false, transitionKind: String? = nil, receivingAudio: Bool = false) {
         self.recording = recording
         self.activeLectureID = activeLectureID
         self.duration = duration
@@ -49,6 +50,7 @@ public struct RuntimeSnapshot: Codable, Sendable {
         self.statusMessage = statusMessage
         self.transitioning = transitioning
         self.transitionKind = transitionKind
+        self.receivingAudio = receivingAudio
     }
 }
 

@@ -24,6 +24,9 @@ public final class MicrophoneRecorder: @unchecked Sendable {
 
     public init() {}
     public var isRecording: Bool {
+        stateLock.withLock { startedAt != nil && engine.isRunning }
+    }
+    public var isReceivingAudio: Bool {
         stateLock.withLock {
             guard startedAt != nil, engine.isRunning, let lastBufferAt else { return false }
             return Date().timeIntervalSince(lastBufferAt) < 2
@@ -106,13 +109,13 @@ public final class MicrophoneRecorder: @unchecked Sendable {
         }
         tapInstalled = true
         do {
-            engine.prepare()
-            try engine.start()
-            guard engine.isRunning else { throw RecorderError.engineStopped }
             stateLock.withLock {
                 startedAt = Date()
                 lastBufferAt = nil
             }
+            engine.prepare()
+            try engine.start()
+            guard engine.isRunning else { throw RecorderError.engineStopped }
             try await firstBuffer.wait(timeout: .seconds(3))
         } catch {
             _ = stop()
