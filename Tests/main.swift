@@ -582,8 +582,9 @@ func testWebSecurityContract() throws {
     try expect(appJavaScript.contains("control.disabled = true"), "long-running controls should prevent duplicate requests")
     try expect(
         appJavaScript.contains("const newestFirst = values => values.slice(-12).reverse()")
-            && appJavaScript.contains("preservedStreams")
-            && appJavaScript.contains("stream.scrollTop = previous.scrollTop +"),
+            && appJavaScript.contains("captureStreamPositions()")
+            && appJavaScript.contains("anchor.offsetTop - previous.anchorOffset")
+            && appJavaScript.contains("restoreStreamPositions(preservedStreams)"),
         "live transcripts should show newest items first without moving a reader who scrolled into older text"
     )
     try expect(

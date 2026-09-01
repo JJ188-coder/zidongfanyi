@@ -93,14 +93,39 @@
 
   function empty(title, copy, action = "新建课程") { const actionID = action === "查看课程历史" ? "view-history" : "new-course"; return `<section class="empty-state"><div><span class="eyebrow">LOCAL ARCHIVE</span><h2>${escapeHTML(title)}</h2><p>${escapeHTML(copy)}</p>${button(action, actionID, "button-primary")}</div></section>`; }
 
+  function captureStreamPositions() {
+    return [...main.querySelectorAll(".transcript-stream[data-stream]")].map(stream => {
+      const children = [...stream.querySelectorAll("[data-segment]")];
+      const anchor = children.find(node => node.offsetTop + node.offsetHeight > stream.scrollTop);
+      return {
+        name: stream.dataset.stream,
+        scrollTop: stream.scrollTop,
+        scrollHeight: stream.scrollHeight,
+        anchorID: anchor?.dataset.segment || null,
+        anchorOffset: anchor ? anchor.offsetTop - stream.scrollTop : 0
+      };
+    });
+  }
+
+  function restoreStreamPositions(positions) {
+    positions.forEach(previous => {
+      const stream = main.querySelector(`.transcript-stream[data-stream="${previous.name}"]`);
+      if (!stream || previous.scrollTop <= 1) return;
+      const anchor = previous.anchorID
+        ? [...stream.querySelectorAll("[data-segment]")].find(node => node.dataset.segment === previous.anchorID)
+        : null;
+      if (anchor) {
+        stream.scrollTop = anchor.offsetTop - previous.anchorOffset;
+        return;
+      }
+      stream.scrollTop = previous.scrollTop + Math.max(0, stream.scrollHeight - previous.scrollHeight);
+    });
+  }
+
   function renderLive() {
     breadcrumb.textContent = "课堂 / 实时课堂"; const selected = course();
     if (!state.courses.length) { main.innerHTML = empty("先建立第一门课程", "课程词汇表会直接帮助本地英文识别器更准确地听懂教授、术语和缩写。"); return; }
-    const preservedStreams = [...main.querySelectorAll(".transcript-stream[data-stream]")].map(node => ({
-      name: node.dataset.stream,
-      scrollTop: node.scrollTop,
-      scrollHeight: node.scrollHeight
-    }));
+    const preservedStreams = captureStreamPositions();
     const segments = state.detail?.transcripts || [];
     const newestFirst = values => values.slice(-12).reverse();
     const english = newestFirst(segments.filter(s => s.source === "liveEnglish"));
@@ -109,14 +134,10 @@
     main.innerHTML = `<section class="page live-page">
       <header class="page-head live-head"><div><span class="eyebrow">LIVE LECTURE</span><h1>听课，不漏掉上下文。</h1><p>英文识别和中文翻译在本机运行；原始录音始终保留。</p></div><div class="lecture-clock"><strong>${fmt(state.runtime.duration)}</strong><span>${state.runtime.recording ? "REC · 正在录音" : "READY · 等待开始"}</span></div></header>
       <div class="control-rail"><label class="select-field"><span>当前课程</span><select id="course-select">${state.courses.map(c => `<option value="${c.id}" ${c.id === selected?.id ? "selected" : ""}>${escapeHTML(c.name)}${c.code ? ` · ${escapeHTML(c.code)}` : ""}</option>`).join("")}</select><small>${escapeHTML(localeLabel(selected?.speechLocaleIdentifier))} · ${(selected?.vocabulary || []).length} 个专业词</small></label><div class="level-block"><span>麦克风</span><progress class="level-track" max="100" value="${Math.round((state.runtime.audioLevel || 0) * 100)}" aria-label="麦克风音量"></progress><small>${state.runtime.recording && (state.runtime.audioLevel || 0) < .08 ? "声音偏小，请靠近教授" : "保持 Mac 靠近声源"}</small></div><div class="control-actions">${button("标记重点", "marker", "button-quiet", !state.runtime.recording || state.runtime.transitioning)}${button(transitionLabel || (state.runtime.recording ? "结束课堂" : "开始课堂"), state.runtime.recording ? "stop" : "start", state.runtime.recording ? "button-danger" : "button-primary", state.runtime.transitioning)}</div></div>
-      <div class="transcript-workspace"><article class="transcript-column"><header><span class="mono-label">ENGLISH · WHISPER</span><span>最新内容在上方</span></header><div class="transcript-stream" data-stream="english">${state.runtime.volatileEnglish ? `<div class="segment draft"><time>LIVE</time><p>${escapeHTML(state.runtime.volatileEnglish)}</p></div>` : ""}${english.length ? english.map(s => `<button class="segment ${s.confidence != null && s.confidence < .55 ? "is-low" : ""}" data-time="${s.startTime}"><time>${fmt(s.startTime)}</time><p>${escapeHTML(s.text)}</p>${s.confidence != null ? `<small>${Math.round(s.confidence * 100)}%</small>` : ""}</button>`).join("") : `<div class="list-empty">${state.runtime.recording ? "正在聆听教授…" : "开始课堂后，确认的英文会出现在这里。"}</div>`}</div></article>
-      <article class="transcript-column chinese"><header><span class="mono-label">简体中文 · APPLE</span><span>最新内容在上方</span></header><div class="transcript-stream" data-stream="chinese">${state.runtime.volatileChinese ? `<div class="segment draft"><time>LIVE</time><p>${escapeHTML(state.runtime.volatileChinese)}</p></div>` : ""}${chinese.length ? chinese.map(s => `<div class="segment"><time>${fmt(s.startTime)}</time><p>${escapeHTML(s.text)}</p></div>`).join("") : `<div class="list-empty">中文会跟随确认后的英文逐段出现。</div>`}</div></article></div>
+      <div class="transcript-workspace"><article class="transcript-column"><header><span class="mono-label">ENGLISH · WHISPER</span><span>最新内容在上方</span></header><div class="transcript-stream" data-stream="english">${state.runtime.volatileEnglish ? `<div class="segment draft"><time>LIVE</time><p>${escapeHTML(state.runtime.volatileEnglish)}</p></div>` : ""}${english.length ? english.map(s => `<button class="segment ${s.confidence != null && s.confidence < .55 ? "is-low" : ""}" data-segment="${escapeHTML(s.id)}" data-time="${s.startTime}"><time>${fmt(s.startTime)}</time><p>${escapeHTML(s.text)}</p>${s.confidence != null ? `<small>${Math.round(s.confidence * 100)}%</small>` : ""}</button>`).join("") : `<div class="list-empty">${state.runtime.recording ? "正在聆听教授…" : "开始课堂后，确认的英文会出现在这里。"}</div>`}</div></article>
+      <article class="transcript-column chinese"><header><span class="mono-label">简体中文 · APPLE</span><span>最新内容在上方</span></header><div class="transcript-stream" data-stream="chinese">${state.runtime.volatileChinese && state.runtime.volatileChinese !== chinese[0]?.text ? `<div class="segment draft"><time>LIVE</time><p>${escapeHTML(state.runtime.volatileChinese)}</p></div>` : ""}${chinese.length ? chinese.map(s => `<div class="segment" data-segment="${escapeHTML(s.id)}"><time>${fmt(s.startTime)}</time><p>${escapeHTML(s.text)}</p></div>`).join("") : `<div class="list-empty">中文会跟随确认后的英文逐段出现。</div>`}</div></article></div>
       <footer class="live-status"><span>${escapeHTML(state.runtime.statusMessage || "录音、识别、翻译互相独立；翻译失败不会停止录音。")}${!state.runtime.translationAvailable ? ` ${button("下载翻译语言", "translation-settings", "button-quiet")}` : ""}</span><span>源文件 · ~/Library/Application Support/Lecture</span></footer></section>`;
-    preservedStreams.forEach(previous => {
-      const stream = main.querySelector(`.transcript-stream[data-stream="${previous.name}"]`);
-      if (!stream || previous.scrollTop <= 1) return;
-      stream.scrollTop = previous.scrollTop + Math.max(0, stream.scrollHeight - previous.scrollHeight);
-    });
+    restoreStreamPositions(preservedStreams);
     document.getElementById("course-select")?.addEventListener("change", e => {
       if (state.runtime.recording) { e.target.value = state.currentCourseID; toast("录音过程中不能切换课程", true); return; }
       state.currentCourseID = e.target.value; state.currentLectureID = null; state.detail = null;
