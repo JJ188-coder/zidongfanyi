@@ -59,13 +59,16 @@ public enum LectureMarkdownExporter {
     }
 
     private static func preferredEnglish(from transcripts: [TranscriptSegment]) -> [TranscriptSegment] {
+        let live = transcripts.filter { $0.source == .liveEnglish }
         let reviewed = transcripts.filter { $0.source == .reviewedEnglish && $0.isFinal }
-        return reviewed.isEmpty ? transcripts.filter { $0.source == .liveEnglish && $0.isFinal } : reviewed
+        return TranscriptPreference.english(live: live, reviewed: reviewed)
     }
 
     private static func preferredChinese(from transcripts: [TranscriptSegment]) -> [TranscriptSegment] {
+        let preferredEnglish = preferredEnglish(from: transcripts)
+        let live = transcripts.filter { $0.source == .liveChinese }
         let corrected = transcripts.filter { $0.source == .correctedChinese && $0.isFinal }
-        return corrected.isEmpty ? transcripts.filter { $0.source == .liveChinese && $0.isFinal } : corrected
+        return TranscriptPreference.chinese(live: live, corrected: corrected, preferredEnglish: preferredEnglish)
     }
 
     private static func appendTranscript(

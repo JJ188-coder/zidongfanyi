@@ -38,6 +38,20 @@ func testDomainModels() throws {
     try expect(!strict.contains("opaque-token"), "bearer token should be redacted")
 }
 
+func testTranscriptPreference() throws {
+    let live = (0..<10).map { index in
+        TranscriptSegment(id: "live-\(index)", lectureID: "lecture", source: .liveEnglish, startTime: Double(index * 6), endTime: Double(index * 6 + 6), text: String(repeating: "reliable classroom words ", count: 5), isFinal: true)
+    }
+    let sparseReview = (0..<4).map { index in
+        TranscriptSegment(id: "review-\(index)", lectureID: "lecture", source: .reviewedEnglish, startTime: Double(index * 15), endTime: Double(index * 15 + 1), text: "Yes.", isFinal: true)
+    }
+    try expect(TranscriptPreference.english(live: live, reviewed: sparseReview) == live, "a sparse review must not replace a richer live transcript")
+    let completeReview = live.map { segment in
+        TranscriptSegment(id: "reviewed-" + segment.id, lectureID: segment.lectureID, source: .reviewedEnglish, startTime: segment.startTime, endTime: segment.endTime, text: segment.text + " reviewed", isFinal: true)
+    }
+    try expect(TranscriptPreference.english(live: live, reviewed: completeReview) == completeReview, "a complete review should remain preferred")
+}
+
 func testAppPaths() throws {
     let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
     let paths = AppPaths(root: root)
@@ -658,6 +672,7 @@ func testWebSecurityContract() throws {
 
 let tests: [(String, () async throws -> Void)] = [
     ("domain", { try testDomainModels() }),
+    ("transcript preference", { try testTranscriptPreference() }),
     ("app paths", { try testAppPaths() }),
     ("lecture Markdown export", { try testLectureMarkdownExport() }),
     ("storage", { try testStorage() }),

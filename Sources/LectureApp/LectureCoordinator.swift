@@ -234,8 +234,9 @@ final class LectureCoordinator: LectureRuntimeControlling, @unchecked Sendable {
     func answer(question: String, courseID: String, lectureID: String?) async throws -> ChatMessage {
         let lectures = try repository.listLectures(courseID: courseID).filter { lectureID == nil || $0.id == lectureID }
         let evidence = try lectures.flatMap { lecture in
+            let live = try repository.transcripts(lectureID: lecture.id, source: .liveEnglish)
             let reviewed = try repository.transcripts(lectureID: lecture.id, source: .reviewedEnglish)
-            let source = reviewed.isEmpty ? try repository.transcripts(lectureID: lecture.id, source: .liveEnglish) : reviewed
+            let source = TranscriptPreference.english(live: live, reviewed: reviewed)
             return GroundingEvidenceFactory.make(lecture: lecture, segments: source)
         }
         let user = ChatMessage(courseID: courseID, lectureID: lectureID, role: .user, text: question); try repository.appendChatMessage(user)
@@ -282,6 +283,7 @@ final class LectureCoordinator: LectureRuntimeControlling, @unchecked Sendable {
         var lecture = original
         do {
             guard let path = lecture.audioPath else { throw CoordinatorError.missingAudio }
+            let live = try repository.transcripts(lectureID: lecture.id, source: .liveEnglish)
             let existingReviewed = try repository.transcripts(lectureID: lecture.id, source: .reviewedEnglish)
             let reviewed: [TranscriptSegment]
             if existingReviewed.isEmpty {
@@ -298,7 +300,7 @@ final class LectureCoordinator: LectureRuntimeControlling, @unchecked Sendable {
                 reviewed = existingReviewed
             }
             lecture.status = .processingDeepSeek; lecture.updatedAt = Date(); try repository.upsertLecture(lecture)
-            let base = reviewed.isEmpty ? try repository.transcripts(lectureID: lecture.id, source: .liveEnglish) : reviewed
+            let base = TranscriptPreference.english(live: live, reviewed: reviewed)
             if (try? keychain.loadAPIKey()) != nil {
                 for segment in try await deepSeek.correctTranslation(englishSegments: base, vocabulary: course?.vocabulary ?? []) { try repository.appendTranscript(segment) }
                 let summary = try await deepSeek.generateStudySummary(lectureTitle: lecture.title, transcript: base); try repository.appendSummary(.init(lectureID: lecture.id, content: summary))

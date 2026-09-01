@@ -42,6 +42,14 @@
     const lowRate = quality?.lowConfidenceRate == null ? "—" : `${Math.round(quality.lowConfidenceRate * 100)}%`;
     return `<article class="quality-card"><span>${escapeHTML(label)}</span><strong>${confidence}</strong><p>平均可信度</p><small>${escapeHTML(qualityLabel(quality))} · ${scored ? `低可信度 ${lowRate}` : "尚无确认字幕"}</small></article>`;
   }
+  function transcriptCharacters(values) { return (values || []).reduce((sum, value) => sum + String(value.text || "").trim().length, 0); }
+  function transcriptCoverage(values) { if (!values?.length) return 0; return Math.max(...values.map(v => Number(v.endTime) || 0)) - Math.min(...values.map(v => Number(v.startTime) || 0)); }
+  function preferredEnglish(live, reviewed) {
+    if (!reviewed.length) return live;
+    if (!live.length) return reviewed;
+    return transcriptCharacters(reviewed) >= Math.max(120, transcriptCharacters(live) * .45)
+      && transcriptCoverage(reviewed) >= Math.max(30, transcriptCoverage(live) * .8) ? reviewed : live;
+  }
   function icon(name) { return `<svg aria-hidden="true"><use href="#icon-${name}"></use></svg>`; }
   function button(label, action, kind = "button-quiet", disabled = false) { return `<button class="button ${kind}" data-action="${action}" ${disabled ? "disabled" : ""}>${escapeHTML(label)}</button>`; }
   function course() { return state.courses.find(c => c.id === state.currentCourseID) || state.courses[0]; }
@@ -160,7 +168,7 @@
     breadcrumb.textContent = "资料库 / 课堂详情";
     if (!state.currentLectureID) { setRoute("history"); return; }
     try { state.detail = await api(`/api/lectures/${state.currentLectureID}`); } catch (e) { toast(e.message, true); return; }
-    const { lecture, transcripts, markers, summaries, liveQuality, reviewedQuality } = state.detail; const reviewed = transcripts.filter(s => s.source === "reviewedEnglish"); const live = transcripts.filter(s => s.source === "liveEnglish"); const english = reviewed.length ? reviewed : live; const corrected = transcripts.filter(s => s.source === "correctedChinese"); const zh = corrected.length ? corrected : transcripts.filter(s => s.source === "liveChinese");
+    const { lecture, transcripts, markers, summaries, liveQuality, reviewedQuality } = state.detail; const reviewed = transcripts.filter(s => s.source === "reviewedEnglish"); const live = transcripts.filter(s => s.source === "liveEnglish"); const english = preferredEnglish(live, reviewed); const corrected = transcripts.filter(s => s.source === "correctedChinese"); const correctedMatchesEnglish = corrected.length && corrected.every(s => english.some(e => e.id === s.sourceSegmentID)); const zh = correctedMatchesEnglish ? corrected : transcripts.filter(s => s.source === "liveChinese");
     main.innerHTML = `<section class="page"><button class="back-link" data-action="back-history">${icon("back")}课程历史</button><header class="page-head"><div><span class="eyebrow">LECTURE RECORD</span><h1>${escapeHTML(lecture.title)}</h1><p>${date(lecture.startedAt)} · ${fmt(lecture.duration)} · ${escapeHTML(statusLabel(lecture.status))}</p></div>${["failed","interrupted","completed"].includes(lecture.status) && (!summaries.length || lecture.status !== "completed") ? button(summaries.length ? "重新处理" : "生成复核与总结", "retry", "button-primary") : ""}</header>
       <div class="audio-console"><audio id="audio" controls preload="metadata" src="/api/lectures/${lecture.id}/audio?token=${encodeURIComponent(token)}"></audio><span>原始录音 · 仅在本机</span></div>
       <section class="quality-panel"><div><span class="eyebrow">RECOGNITION QUALITY</span><h2>识别质量证据</h2><p>Whisper 在本机运行；原音、时间轴和实时/复核双版本用于抽查。严格准确率请用已知稿计算 WER。</p></div><div class="quality-cards">${qualityCard("实时确认稿", liveQuality)}${qualityCard("课后复核稿", reviewedQuality)}</div></section>
