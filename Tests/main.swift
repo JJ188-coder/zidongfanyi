@@ -415,6 +415,16 @@ func testDeepSeekTranslationRetrySafety() async throws {
 
     StubURLProtocol.reset()
     StubURLProtocol.enqueue(body: try completionEnvelope(content: #"{"translations":[]}"#))
+    StubURLProtocol.enqueue(body: try completionEnvelope(content: #"{"translations":[{"unitID":"invented-id","chinese":"错误 ID"}]}"#))
+    StubURLProtocol.enqueue(body: try completionEnvelope(content: #"{"translations":[{"unitID":"seg-retry-0","chinese":"恢复后的翻译。"}]}"#))
+    let recovered = try await client.correctTranslation(englishSegments: [segment], vocabulary: [])
+    try expect(recovered.first?.text == "恢复后的翻译。", "translation should retry malformed DeepSeek unit IDs")
+    try expect(StubURLProtocol.requests().count == 3, "a malformed translation chunk should retry at most three times")
+
+    StubURLProtocol.reset()
+    StubURLProtocol.enqueue(body: try completionEnvelope(content: #"{"translations":[]}"#))
+    StubURLProtocol.enqueue(body: try completionEnvelope(content: #"{"translations":[]}"#))
+    StubURLProtocol.enqueue(body: try completionEnvelope(content: #"{"translations":[]}"#))
     do {
         _ = try await client.correctTranslation(englishSegments: [segment], vocabulary: [])
         throw TestFailure(description: "missing translation units must fail the corrected transcript")

@@ -24,22 +24,37 @@ public final class DeepSeekClient: @unchecked Sendable {
         guard englishSegments.contains(where: \.isFinal) else { throw DeepSeekError.missingTranscript }
         var output: [TranscriptSegment] = []
         for chunk in DeepSeekTranscriptChunker.chunks(from: englishSegments) {
-            let input = try jsonString(chunk.units)
-            let raw = try await complete(system: "Translate university lecture English into accurate Simplified Chinese. Preserve every unitID. Return only JSON: {\"translations\":[{\"unitID\":\"...\",\"chinese\":\"...\"}]}. Course vocabulary: \(vocabulary.joined(separator: ", "))", user: input)
-            let parsed: Result = try DeepSeekResponseParser.decodeJSON(Result.self, from: raw)
             let byID = Dictionary(uniqueKeysWithValues: chunk.units.map { ($0.id, $0) })
-            var translatedByUnitID: [String: String] = [:]
-            for value in parsed.translations {
-                guard byID[value.unitID] != nil, translatedByUnitID[value.unitID] == nil else {
-                    throw DeepSeekError.invalidResponse("翻译单元 ID 无效或重复")
+            let input = try jsonString(chunk.units)
+            var translatedByUnitID: [String: String]?
+            var lastError: Error?
+            for attempt in 0..<3 {
+                do {
+                    let raw = try await complete(
+                        system: "Translate university lecture English into accurate Simplified Chinese. Copy each supplied unit id exactly once into unitID; never invent, shorten, reorder, or duplicate IDs. Return only JSON: {\"translations\":[{\"unitID\":\"exact supplied id\",\"chinese\":\"...\"}]}. Course vocabulary: \(vocabulary.joined(separator: ", "))",
+                        user: input
+                    )
+                    let parsed: Result = try DeepSeekResponseParser.decodeJSON(Result.self, from: raw)
+                    var candidate: [String: String] = [:]
+                    for value in parsed.translations {
+                        guard byID[value.unitID] != nil, candidate[value.unitID] == nil else {
+                            throw DeepSeekError.invalidResponse("翻译单元 ID 无效或重复")
+                        }
+                        let chinese = value.chinese.trimmingCharacters(in: .whitespacesAndNewlines)
+                        guard !chinese.isEmpty else { throw DeepSeekError.invalidResponse("翻译内容为空") }
+                        candidate[value.unitID] = chinese
+                    }
+                    guard candidate.count == chunk.units.count else {
+                        throw DeepSeekError.invalidResponse("翻译结果缺少部分逐字稿单元")
+                    }
+                    translatedByUnitID = candidate
+                    break
+                } catch {
+                    lastError = error
+                    if attempt < 2 { try? await Task.sleep(for: .milliseconds(Int64(400 * (attempt + 1)))) }
                 }
-                let chinese = value.chinese.trimmingCharacters(in: .whitespacesAndNewlines)
-                guard !chinese.isEmpty else { throw DeepSeekError.invalidResponse("翻译内容为空") }
-                translatedByUnitID[value.unitID] = chinese
             }
-            guard translatedByUnitID.count == chunk.units.count else {
-                throw DeepSeekError.invalidResponse("翻译结果缺少部分逐字稿单元")
-            }
+            guard let translatedByUnitID else { throw lastError ?? DeepSeekError.invalidResponse("翻译失败") }
             for unit in chunk.units {
                 guard let chinese = translatedByUnitID[unit.id] else {
                     throw DeepSeekError.invalidResponse("翻译结果缺少逐字稿单元 \(unit.id)")
