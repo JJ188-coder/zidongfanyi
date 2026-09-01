@@ -49,6 +49,7 @@ public func testLectureSpeech() throws {
     try testWhisperFileSmoke()
     try testLectureEnglishLocaleResolution()
     try testAudioLevels()
+    try testStreamingWAVWriter()
     try testCheckpointCadence()
 }
 
@@ -398,6 +399,23 @@ private func testAudioLevels() throws {
         normalSpeech.normalized - quietSpeech.normalized > 0.25,
         "the classroom meter should visibly distinguish quiet and normal speech"
     )
+}
+
+private func testStreamingWAVWriter() throws {
+    let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: root) }
+    let url = root.appendingPathComponent("stream.wav")
+    let handle = try WhisperWAVWriter.createEmptyFile(at: url)
+    try WhisperWAVWriter.append(samples: [1, -1], to: handle)
+    try WhisperWAVWriter.append(samples: [2, -2], to: handle)
+    try WhisperWAVWriter.finalize(handle, sampleCount: 4)
+    let data = try Data(contentsOf: url)
+    try speechExpect(data.count == 44 + 8, "streaming WAV size")
+    try speechExpect(Array(data[4..<8]) == [44, 0, 0, 0], "streaming RIFF size")
+    try speechExpect(Array(data[40..<44]) == [8, 0, 0, 0], "streaming payload size")
+    let mode = try FileManager.default.attributesOfItem(atPath: url.path)[.posixPermissions] as? NSNumber
+    try speechExpect(mode?.intValue == 0o600, "streaming WAV permissions")
 }
 
 private func testCheckpointCadence() throws {

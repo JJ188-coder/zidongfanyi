@@ -255,7 +255,12 @@ public final class WhisperCLI: @unchecked Sendable {
         do { inputFile = try AVAudioFile(forReading: inputURL) }
         catch { throw WhisperError.launchFailed("无法读取课堂录音") }
         let converter = try WhisperAudioConverter(sourceFormat: inputFile.processingFormat)
-        var allSamples: [Int16] = []
+        let outputHandle = try WhisperWAVWriter.createEmptyFile(at: outputURL)
+        var sampleCount: Int64 = 0
+        var finalized = false
+        defer {
+            if !finalized { try? outputHandle.close() }
+        }
         let frameCount: AVAudioFrameCount = 16_384
         while inputFile.framePosition < inputFile.length {
             let remaining = inputFile.length - inputFile.framePosition
@@ -269,9 +274,10 @@ public final class WhisperCLI: @unchecked Sendable {
             guard buffer.frameLength > 0 else { break }
             let samples = try converter.convert(buffer)
             guard !samples.isEmpty else { continue }
-            allSamples.append(contentsOf: samples)
+            try WhisperWAVWriter.append(samples: samples, to: outputHandle)
+            sampleCount += Int64(samples.count)
         }
-        try WhisperWAVWriter.data(samples: allSamples).write(to: outputURL, options: .atomic)
-        try fileManager.setAttributes([.posixPermissions: 0o600], ofItemAtPath: outputURL.path)
+        try WhisperWAVWriter.finalize(outputHandle, sampleCount: sampleCount)
+        finalized = true
     }
 }
