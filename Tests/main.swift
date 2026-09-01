@@ -581,7 +581,7 @@ func testWebSecurityContract() throws {
     try expect(appJavaScript.contains("正在准备…"), "long-running start should show visible progress")
     try expect(appJavaScript.contains("control.disabled = true"), "long-running controls should prevent duplicate requests")
     try expect(
-        appJavaScript.contains("const newestFirst = values => values.slice(-12).reverse()")
+        appJavaScript.contains("const newestFirst = values => values.slice(-120).reverse()")
             && appJavaScript.contains("captureStreamPositions()")
             && appJavaScript.contains("anchor.offsetTop - previous.anchorOffset")
             && appJavaScript.contains("restoreStreamPositions(preservedStreams)"),
