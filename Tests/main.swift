@@ -785,8 +785,9 @@ func testWebSecurityContract() throws {
     try expect(
         coordinatorSource.contains("let recording = recorder.hasActiveSession")
             && coordinatorSource.contains("let receivingAudio = recorder.isReceivingAudio")
+            && coordinatorSource.contains("activeLecture.courseID == courseID")
             && coordinatorSource.contains("lastStoppedLecture?.id == requestedLectureID"),
-        "recording state must survive a quiet input stream and duplicate stop calls must return the same lecture"
+        "recording state must survive quiet input, duplicate starts must match the course, and duplicate stops must return the same lecture"
     )
     try expect(
         coordinatorSource.contains("guard !live.isEmpty else { throw error }")

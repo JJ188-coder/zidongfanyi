@@ -108,17 +108,20 @@ final class LectureCoordinator: LectureRuntimeControlling, @unchecked Sendable {
     }
 
     func startLecture(courseID: String, title: String?) async throws -> LectureRecord {
-        enum StartDecision { case existing(LectureRecord), wait, reserved }
+        enum StartDecision { case existing(LectureRecord), conflict, wait, reserved }
         let deadline = Date().addingTimeInterval(60)
         reserve: while true {
             let decision = withState { () -> StartDecision in
                 if transition != nil { return .wait }
-                if let activeLecture { return .existing(activeLecture) }
+                if let activeLecture {
+                    return activeLecture.courseID == courseID ? .existing(activeLecture) : .conflict
+                }
                 transition = .starting
                 return .reserved
             }
             switch decision {
             case .existing(let lecture): return lecture
+            case .conflict: throw CoordinatorError.alreadyRecording
             case .reserved: break reserve
             case .wait:
                 guard Date() < deadline else { throw CoordinatorError.busy }
